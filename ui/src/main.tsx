@@ -5,6 +5,8 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "@/lib/router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
+import { i18n } from "./i18n";
+import { installChineseUi } from "./i18n/zh-ui";
 import { CompanyProvider, useCompany } from "./context/CompanyContext";
 import { LiveUpdatesProvider } from "./context/LiveUpdatesProvider";
 import { BreadcrumbProvider } from "./context/BreadcrumbContext";
@@ -23,10 +25,13 @@ import "./index.css";
 
 initPluginBridge(React, ReactDOM);
 
-// React 19.2 emits an unbounded stream of performance.measure() entries for its
-// DevTools performance tracks and never clears them; on a long-lived tab they
-// accumulate into millions of native objects (GBs). Reap them periodically.
+// Preserve upstream's React 19.2 performance-entry safeguard.
 startPerfMeasureReaper();
+
+// Paperclip still exposes some UI copy outside i18next. Keep the local
+// Simplified-Chinese compatibility layer while upstream migrates these strings.
+void i18n.changeLanguage("zh-CN");
+installChineseUi();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
@@ -81,5 +86,5 @@ createRoot(document.getElementById("root")!).render(
         </BrowserRouter>
       </ThemeProvider>
     </QueryClientProvider>
-  </StrictMode>
+  </StrictMode>,
 );

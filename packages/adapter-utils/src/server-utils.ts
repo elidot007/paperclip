@@ -3359,10 +3359,22 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          const handleStdinError = (err: Error) => {
+            const code = (err as NodeJS.ErrnoException).code;
+            // The child may exit while Paperclip is still persisting spawn
+            // metadata. In that race, writing the prompt is best-effort and a
+            // closed pipe must not crash the long-lived control plane.
+            if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
+            onLogError(err, runId, "failed to write child process stdin");
+          };
+          stdin.on("error", handleStdinError);
           void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            if (child.killed || stdin.destroyed || !stdin.writable) return;
+            try {
+              stdin.end(opts.stdin as string);
+            } catch (err) {
+              handleStdinError(err instanceof Error ? err : new Error(String(err)));
+            }
           });
         }
 

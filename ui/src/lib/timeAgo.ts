@@ -8,24 +8,25 @@ export function timeAgo(date: Date | string): string {
   const now = Date.now();
   const then = new Date(date).getTime();
   const seconds = Math.round((now - then) / 1000);
+  const chinese = typeof document !== "undefined" && document.documentElement.lang === "zh-CN";
 
-  if (seconds < MINUTE) return "just now";
+  if (seconds < MINUTE) return chinese ? "刚刚" : "just now";
   if (seconds < HOUR) {
     const m = Math.floor(seconds / MINUTE);
-    return `${m}m ago`;
+    return chinese ? `${m}分钟前` : `${m}m ago`;
   }
   if (seconds < DAY) {
     const h = Math.floor(seconds / HOUR);
-    return `${h}h ago`;
+    return chinese ? `${h}小时前` : `${h}h ago`;
   }
   if (seconds < WEEK) {
     const d = Math.floor(seconds / DAY);
-    return `${d}d ago`;
+    return chinese ? `${d}天前` : `${d}d ago`;
   }
   if (seconds < MONTH) {
     const w = Math.floor(seconds / WEEK);
-    return `${w}w ago`;
+    return chinese ? `${w}周前` : `${w}w ago`;
   }
   const mo = Math.floor(seconds / MONTH);
-  return `${mo}mo ago`;
+  return chinese ? `${mo}个月前` : `${mo}mo ago`;
 }

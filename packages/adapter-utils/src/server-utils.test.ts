@@ -410,6 +410,31 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("does not crash when the child closes stdin before spawn metadata persistence completes", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.exit(0);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "prompt that arrives after the child exits",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    // Let the delayed stdin write attempt settle. Before the regression fix,
+    // this emitted an unhandled EPIPE and terminated the parent Node process.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
