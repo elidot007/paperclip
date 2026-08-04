@@ -137,6 +137,14 @@ The Factory converts approved deliverables into a dependency graph of Paperclip 
 
 Connectors are capability-gated plugin integrations. Initial implementation is read/assist only where possible. Publication, payment, procurement, ads, production deployment, credential movement and destructive calls require approval interactions. Connectors are never granted by an arbitrary skill without company, project and agent permission checks.
 
+### 4.8 Codex Skill Registry and task-scoped capability selection
+
+The AI Company Factory maintains a Company Skill Library backed by an explicit local Codex Skill Registry workspace. Importing a Skill makes it *available* to the company; it does **not** add that Skill to every Agent's persistent `desiredSkills`.
+
+Every execution issue must include a `Task Skill Manifest` and real Paperclip Skill Mentions for the minimum Skills required by that task. Paperclip resolves those mentions from the issue title, description, and comments, then materializes them in the assignee's effective `CODEX_HOME/skills` directory for that run only. The role baseline remains unchanged after the run.
+
+The `task-skill-router` Company Skill is the required selection workflow. A failed Company Skill audit is excluded by default; warnings require the task manifest to justify the choice and high-risk capabilities still require the appropriate Board approval. Source-skill synchronization is an operator-controlled rescan/import of the Registry workspace, not a timer-driven grant of new abilities.
+
 ## 5. Reusable company templates
 
 The first three templates are deliberately limited and all use Codex for technical work:
@@ -179,6 +187,10 @@ Exact paths may be adjusted to current upstream plugin conventions after upgrade
 ### Phase 1 — Codex-first single-company MVP
 
 - [x] Create the governed `AI Company Factory` company, Codex Company Architect (on-demand only), Company Factory Foundation project, and `AIC-1` implementation issue.
+- [x] Create the `Codex Skill Registry` project with a non-primary local Codex source workspace and a Git-backed primary execution workspace.
+- [x] Synchronize the discoverable local Codex Skills into the Company Skill Library without granting them to all Agents; record audit results before task use.
+- [x] Verify native task-scoped injection with `AIC-3`: a real issue Skill Mention materialized a non-baseline Codex Skill in the Architect's effective `CODEX_HOME/skills`, while the stored `desiredSkills` baseline remained unchanged.
+- [ ] Complete the Agent self-report portion of `AIC-3` after repairing the configured Codex provider credential; the 2026-08-04 runtime reached the adapter but returned `401 Invalid token` before the worker could post its verification comment.
 - [ ] Add `FactoryRequest` and proposal lifecycle.
 - [ ] Board Chat creates a structured intake proposal using a Codex Board/Meta Orchestrator.
 - [ ] Add Dev Agency template with Codex PM, engineer, QA and documentation roles.
@@ -236,7 +248,8 @@ Track the following from the first MVP:
 
 ## 10. Immediate next actions
 
-1. Keep the updated local UI customization and this plan committed on the foundation branch.
-2. Implement `AIC-1` through the small vertical slice: request -> proposal -> approval -> Codex Dev Agency project -> QA artifact.
-3. Do not enable a timer heartbeat for the Codex architect; wake only from assigned approved work.
-4. Introduce Memory Hub only after the request/proposal/approval seam is tested.
+1. Keep the updated local UI customization, Skill Registry baseline, and this plan committed on the foundation branch.
+2. Repair or replace the configured Codex provider credential, then resume the read-only `AIC-3` verification before creating additional worker Agents.
+3. Implement `AIC-1` through the small vertical slice: request -> proposal -> approval -> Codex Dev Agency project -> QA artifact.
+4. Do not enable a timer heartbeat for the Codex architect; wake only from assigned approved work.
+5. Introduce Memory Hub only after the request/proposal/approval seam is tested.
