@@ -400,6 +400,104 @@ describe("seedManagedCodexHome", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("syncs a safe relative model catalog referenced by config.toml", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-catalog-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const agentHome = path.join(root, "managed", "agent-home");
+      const catalogRelativePath = path.join("catalogs", "models.json");
+      const catalogBytes = '{"models":[{"slug":"gpt-test"}]}\n';
+
+      await fs.mkdir(path.join(sharedCodexHome, "catalogs"), { recursive: true });
+      await fs.writeFile(
+        path.join(sharedCodexHome, "config.toml"),
+        `model_catalog_json = ${JSON.stringify(catalogRelativePath)}\n`,
+        "utf8",
+      );
+      await fs.writeFile(path.join(sharedCodexHome, catalogRelativePath), catalogBytes, "utf8");
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedCodexHome }, async () => {});
+
+      const managedCatalog = path.join(agentHome, catalogRelativePath);
+      expect(await fs.readFile(managedCatalog, "utf8")).toBe(catalogBytes);
+      expect((await fs.stat(managedCatalog)).mode & 0o777).toBe(0o600);
+
+      const updatedCatalogBytes = '{"models":[{"slug":"gpt-test-2"}]}\n';
+      await fs.writeFile(
+        path.join(sharedCodexHome, catalogRelativePath),
+        updatedCatalogBytes,
+        "utf8",
+      );
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedCodexHome }, async () => {});
+      expect(await fs.readFile(managedCatalog, "utf8")).toBe(updatedCatalogBytes);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes stale shared config while preserving the Paperclip-managed MCP block", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-config-refresh-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const agentHome = path.join(root, "agent-home");
+      const managedBlock = [
+        "# BEGIN PAPERCLIP MANAGED MCP",
+        "# Written by Paperclip for governed MCP gateway access. Do not edit this block by hand.",
+        '[mcp_servers."paperclip"]',
+        'url = "https://paperclip.example/mcp"',
+        'headers = { Authorization = "Bearer run-token" }',
+        "# END PAPERCLIP MANAGED MCP",
+      ].join("\n");
+
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.mkdir(agentHome, { recursive: true });
+      await fs.writeFile(
+        path.join(sharedCodexHome, "config.toml"),
+        'model_provider = "current"\n[model_providers.current]\nbase_url = "https://current.example/v1"\n',
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(agentHome, "config.toml"),
+        `model_provider = "stale"\n[model_providers.stale]\nbase_url = "https://stale.example/v1"\n\n${managedBlock}\n`,
+        "utf8",
+      );
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedCodexHome }, async () => {});
+
+      const refreshed = await fs.readFile(path.join(agentHome, "config.toml"), "utf8");
+      expect(refreshed).toContain('model_provider = "current"');
+      expect(refreshed).toContain('base_url = "https://current.example/v1"');
+      expect(refreshed).not.toContain("stale.example");
+      expect(refreshed).toContain(managedBlock);
+      expect((await fs.stat(path.join(agentHome, "config.toml"))).mode & 0o777).toBe(0o600);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not copy a model catalog path that escapes the shared Codex home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-catalog-escape-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const agentHome = path.join(root, "managed", "agent-home");
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.writeFile(path.join(root, "outside.json"), '{"secret":true}\n', "utf8");
+      await fs.writeFile(
+        path.join(sharedCodexHome, "config.toml"),
+        'model_catalog_json = "../outside.json"\n',
+        "utf8",
+      );
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedCodexHome }, async () => {});
+
+      await expect(fs.access(path.join(root, "managed", "outside.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // Startup backfill for already-isolated managed homes.
@@ -778,12 +876,18 @@ describe("stageCodexHomeForSync", () => {
   // `auth.json` as a symlink into a separate source-bytes file and a populated
   // `skills/` symlink, mirroring the real managed home) plus decoy runtime
   // state the allowlist must NOT copy.
-  async function buildFakeHome(root: string): Promise<{ home: string; authBytes: string; skillBytes: string }> {
+  async function buildFakeHome(root: string): Promise<{
+    home: string;
+    authBytes: string;
+    skillBytes: string;
+    catalogBytes: string;
+  }> {
     const home = path.join(root, "codex-home");
     const authSource = path.join(root, "shared", "auth.json");
     const skillSource = path.join(root, "shared", "skill-src.md");
     const authBytes = '{"tokens":{"account_id":"acct","refresh_token":"r"}}\n';
     const skillBytes = "# injected skill\n";
+    const catalogBytes = '{"models":[{"slug":"paperclip-test"}]}\n';
 
     await fs.mkdir(path.join(root, "shared"), { recursive: true });
     await fs.writeFile(authSource, authBytes, "utf8");
@@ -792,7 +896,12 @@ describe("stageCodexHomeForSync", () => {
     await fs.mkdir(home, { recursive: true });
     // auth.json is a symlink into the shared source (single-use rotating tokens).
     await fs.symlink(authSource, path.join(home, "auth.json"));
-    await fs.writeFile(path.join(home, "config.toml"), "model_provider = \"paperclip\"\n", "utf8");
+    await fs.writeFile(
+      path.join(home, "config.toml"),
+      'model_provider = "paperclip"\nmodel_catalog_json = "model-catalog.json"\n',
+      "utf8",
+    );
+    await fs.writeFile(path.join(home, "model-catalog.json"), catalogBytes, "utf8");
     await fs.writeFile(path.join(home, "config.json"), "{}\n", "utf8");
     await fs.writeFile(path.join(home, "instructions.md"), "hi\n", "utf8");
     // skills/ is a directory of symlinks.
@@ -809,18 +918,18 @@ describe("stageCodexHomeForSync", () => {
     await fs.mkdir(path.join(home, "tmp"), { recursive: true });
     await fs.symlink("/usr/bin/env", path.join(home, "tmp", "arg0"));
 
-    return { home, authBytes, skillBytes };
+    return { home, authBytes, skillBytes, catalogBytes };
   }
 
-  it("stages exactly the allowlist, derefs auth.json to bytes, and excludes decoys", async () => {
+  it("stages the fixed allowlist and config companions, derefs auth.json, and excludes decoys", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-"));
     let staged: string | null = null;
     try {
-      const { home, authBytes, skillBytes } = await buildFakeHome(root);
+      const { home, authBytes, skillBytes, catalogBytes } = await buildFakeHome(root);
       staged = await stageCodexHomeForSync(home, { runId: "run-1" });
 
       const entries = (await fs.readdir(staged)).sort();
-      expect(entries).toEqual([...CODEX_SYNC_ALLOWLIST].sort());
+      expect(entries).toEqual([...CODEX_SYNC_ALLOWLIST, "model-catalog.json"].sort());
 
       // Decoys must be absent.
       for (const decoy of ["logs_2.sqlite", "state_5.sqlite", "plugins", "sessions", "tmp"]) {
@@ -839,6 +948,8 @@ describe("stageCodexHomeForSync", () => {
 
       // config.toml (post-rewrite state) carried through.
       expect(await fs.readFile(path.join(staged, "config.toml"), "utf8")).toContain("model_provider");
+      expect(await fs.readFile(path.join(staged, "model-catalog.json"), "utf8")).toBe(catalogBytes);
+      expect((await fs.stat(path.join(staged, "model-catalog.json"))).mode & 0o777).toBe(0o600);
     } finally {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });
@@ -854,6 +965,32 @@ describe("stageCodexHomeForSync", () => {
       staged = await stageCodexHomeForSync(home, { runId: "run-mode" });
       const mode = (await fs.stat(path.join(staged, "auth.json"))).mode & 0o777;
       expect(mode).toBe(0o600);
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not stage a model catalog symlink that escapes the Codex home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-catalog-escape-"));
+    let staged: string | null = null;
+    try {
+      const home = path.join(root, "codex-home");
+      const outsideCatalog = path.join(root, "outside-model-catalog.json");
+      await fs.mkdir(home, { recursive: true });
+      await fs.writeFile(
+        path.join(home, "config.toml"),
+        'model_catalog_json = "model-catalog.json"\n',
+        "utf8",
+      );
+      await fs.writeFile(outsideCatalog, '{"secret":true}\n', "utf8");
+      await fs.symlink(outsideCatalog, path.join(home, "model-catalog.json"));
+
+      staged = await stageCodexHomeForSync(home, { runId: "run-catalog-escape" });
+
+      await expect(fs.access(path.join(staged, "model-catalog.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });

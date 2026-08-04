@@ -7,18 +7,22 @@ import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-uti
 const TRUTHY_ENV_RE = /^(1|true|yes|on)$/i;
 const COPIED_SHARED_FILES = ["config.json", "config.toml", "instructions.md"] as const;
 const SYMLINKED_SHARED_FILES = ["auth.json"] as const;
+const CONFIG_COMPANION_FILE_KEYS = ["model_catalog_json"] as const;
 const MANAGED_MCP_BLOCK_START = "# BEGIN PAPERCLIP MANAGED MCP";
 const MANAGED_MCP_BLOCK_END = "# END PAPERCLIP MANAGED MCP";
 
 /**
- * The allowlist of managed `CODEX_HOME` entries that the codex-local adapter
- * stages into the sandbox `home` asset (see {@link stageCodexHomeForSync}).
- * Derived from the seeding constants so it can never drift from what the adapter
- * actually writes into the home: the copied static config files, the symlinked
- * credential file, and the injected `skills/` directory. Everything else the
- * stock upstream `codex` binary writes at runtime (`*.sqlite`, `*-wal`,
- * `plugins/`, `cache/`, `sessions/`, `shell_snapshots/`, …) is intentionally
- * excluded — it is large host-local runtime state the sandbox run never needs.
+ * The fixed allowlist of managed `CODEX_HOME` entries that the codex-local
+ * adapter stages into the sandbox `home` asset (see
+ * {@link stageCodexHomeForSync}). Derived from the seeding constants so it can
+ * never drift from what the adapter actually writes into the home: the copied
+ * static config files, the symlinked credential file, and the injected
+ * `skills/` directory. Safe relative companion files explicitly referenced by
+ * `config.toml` (currently `model_catalog_json`) are discovered separately and
+ * staged alongside this fixed set. Everything else the stock upstream `codex`
+ * binary writes at runtime (`*.sqlite`, `*-wal`, `plugins/`, `cache/`,
+ * `sessions/`, `shell_snapshots/`, …) is intentionally excluded — it is large
+ * host-local runtime state the sandbox run never needs.
  */
 export const CODEX_SYNC_ALLOWLIST = [
   ...COPIED_SHARED_FILES,
@@ -231,6 +235,116 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   await fs.copyFile(source, target);
 }
 
+function readTopLevelTomlString(config: string, key: string): string | null {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const assignment = new RegExp(
+    `^\\s*${escapedKey}\\s*=\\s*(\"(?:\\\\.|[^\"\\\\])*\"|'[^']*')\\s*(?:#.*)?$`,
+  );
+
+  for (const line of config.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    // In TOML, keys after a table header belong to that table; the Codex
+    // companion settings we support are top-level keys only.
+    if (trimmed.startsWith("[")) break;
+    const match = assignment.exec(line);
+    if (!match) continue;
+    const token = match[1];
+    if (token.startsWith("'")) return token.slice(1, -1);
+    try {
+      return JSON.parse(token) as string;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function readConfigCompanionEntries(config: string): string[] {
+  const entries = new Set<string>();
+  for (const key of CONFIG_COMPANION_FILE_KEYS) {
+    const raw = readTopLevelTomlString(config, key);
+    if (!raw || raw.includes("\0") || path.isAbsolute(raw)) continue;
+    const normalized = path.normalize(raw);
+    if (
+      normalized === "." ||
+      normalized === ".." ||
+      normalized.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(normalized)
+    ) {
+      continue;
+    }
+    entries.add(normalized);
+  }
+  return [...entries];
+}
+
+async function resolveContainedRegularFile(root: string, entry: string): Promise<string | null> {
+  const lexicalRoot = path.resolve(root);
+  const lexicalCandidate = path.resolve(lexicalRoot, entry);
+  if (!isResolvedPathInside(lexicalCandidate, lexicalRoot)) return null;
+
+  const realRoot = await fs.realpath(lexicalRoot).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!realRoot) return null;
+  const realCandidate = await fs.realpath(lexicalCandidate).catch((error) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ELOOP") return null;
+    throw error;
+  });
+  if (!realCandidate || !isResolvedPathInside(realCandidate, realRoot)) return null;
+  const stat = await fs.stat(realCandidate).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  return stat?.isFile() ? realCandidate : null;
+}
+
+async function syncConfigCompanionFiles(input: {
+  sourceHome: string;
+  targetHome: string;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const configPath = path.join(input.targetHome, "config.toml");
+  const config = await fs.readFile(configPath, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (config === null) return;
+
+  for (const entry of readConfigCompanionEntries(config)) {
+    const source = await resolveContainedRegularFile(input.sourceHome, entry);
+    if (!source) continue;
+    const target = path.resolve(input.targetHome, entry);
+    const existing = await fs.lstat(target).catch(() => null);
+    if (existing?.isDirectory()) continue;
+
+    let changed = true;
+    if (existing?.isFile()) {
+      const [sourceBytes, targetBytes] = await Promise.all([
+        fs.readFile(source),
+        fs.readFile(target),
+      ]);
+      changed = !sourceBytes.equals(targetBytes);
+    }
+    if (!changed) {
+      await fs.chmod(target, 0o600);
+      continue;
+    }
+
+    await ensureParentDir(target);
+    if (existing?.isSymbolicLink()) await fs.unlink(target);
+    await fs.copyFile(source, target);
+    await fs.chmod(target, 0o600);
+    await input.onLog(
+      "stdout",
+      `[paperclip] Synced Codex config companion "${entry}" into managed home "${input.targetHome}".\n`,
+    );
+  }
+}
+
 function tomlString(value: string): string {
   return JSON.stringify(value);
 }
@@ -250,6 +364,44 @@ function stripManagedMcpBlock(config: string): string {
   const end = config.indexOf(MANAGED_MCP_BLOCK_END, start);
   if (end < 0) return config.slice(0, start).trimEnd();
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
+}
+
+function readManagedMcpBlock(config: string): string | null {
+  const start = config.indexOf(MANAGED_MCP_BLOCK_START);
+  if (start < 0) return null;
+  const end = config.indexOf(MANAGED_MCP_BLOCK_END, start);
+  if (end < 0) return null;
+  return config.slice(start, end + MANAGED_MCP_BLOCK_END.length).trim();
+}
+
+async function syncManagedConfigToml(input: {
+  source: string;
+  target: string;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const sourceConfig = await fs.readFile(input.source, "utf8");
+  const targetConfig = await fs.readFile(input.target, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw error;
+  });
+  // The shared config is the operator-owned source of truth. Paperclip-owned
+  // gateway credentials are the only target-local content that survives a
+  // refresh; they are rewritten for the current run immediately afterwards.
+  const sourceBase = stripManagedMcpBlock(sourceConfig);
+  const managedBlock = readManagedMcpBlock(targetConfig);
+  const next = managedBlock
+    ? `${sourceBase}${sourceBase ? "\n\n" : ""}${managedBlock}\n`
+    : `${sourceBase}${sourceBase ? "\n" : ""}`;
+
+  await ensureParentDir(input.target);
+  if (targetConfig !== next) {
+    await fs.writeFile(input.target, next, { mode: 0o600 });
+    await input.onLog(
+      "stdout",
+      `[paperclip] Refreshed managed Codex config from shared source "${input.source}".\n`,
+    );
+  }
+  await fs.chmod(input.target, 0o600);
 }
 
 function readCodexMcpServerNames(config: string): Set<string> {
@@ -526,11 +678,12 @@ async function stageCodexHomeEntry(
 }
 
 /**
- * Stages exactly {@link CODEX_SYNC_ALLOWLIST} from `effectiveCodexHome` into a
- * fresh private temp dir and returns its path, for registration as the sandbox
- * `home` asset. This replaces syncing the whole managed home + a name denylist:
- * only the files Codex actually needs are uploaded, so oversized runtime state
- * (`sessions/`, `*.sqlite`, `plugins/`, …) never reaches the sandbox.
+ * Stages {@link CODEX_SYNC_ALLOWLIST} plus safe relative config companion files
+ * from `effectiveCodexHome` into a fresh private temp dir and returns its path,
+ * for registration as the sandbox `home` asset. This replaces syncing the whole
+ * managed home + a name denylist: only the files Codex actually needs are
+ * uploaded, so oversized runtime state (`sessions/`, `*.sqlite`, `plugins/`, …)
+ * never reaches the sandbox.
  *
  * - **Symlinks are dereferenced to bytes** — the single-use `auth.json`
  *   credential (a symlink into the shared source home) and each `skills/` entry
@@ -557,6 +710,21 @@ export async function stageCodexHomeForSync(
   try {
     for (const entry of CODEX_SYNC_ALLOWLIST) {
       await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
+    }
+    const config = await fs.readFile(path.join(effectiveCodexHome, "config.toml"), "utf8").catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (config !== null) {
+      for (const entry of readConfigCompanionEntries(config)) {
+        const source = await resolveContainedRegularFile(effectiveCodexHome, entry);
+        if (!source) continue;
+        const target = path.resolve(stagedHome, entry);
+        await ensureParentDir(target);
+        const bytes = await fs.readFile(source);
+        await fs.writeFile(target, bytes, { mode: 0o600 });
+        await fs.chmod(target, 0o600);
+      }
     }
     return stagedHome;
   } catch (error) {
@@ -610,8 +778,15 @@ export async function seedManagedCodexHome(
     for (const name of COPIED_SHARED_FILES) {
       const source = path.join(sourceHome, name);
       if (!(await pathExists(source))) continue;
-      await ensureCopiedFile(path.join(targetHome, name), source);
+      const target = path.join(targetHome, name);
+      if (name === "config.toml") {
+        await syncManagedConfigToml({ source, target, onLog });
+      } else {
+        await ensureCopiedFile(target, source);
+      }
     }
+
+    await syncConfigCompanionFiles({ sourceHome, targetHome, onLog });
 
     await onLog(
       "stdout",
