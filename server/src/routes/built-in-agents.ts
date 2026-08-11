@@ -82,6 +82,11 @@ export function builtInAgentRoutes(db: Db) {
     }
   }
 
+  async function builtInAgentsEnabled(): Promise<boolean> {
+    const experimental = await settings.getExperimental();
+    return experimental.enableBuiltInAgents === true;
+  }
+
   async function assertCanProvisionBuiltInAgents(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
     const decision = await access.decide({
@@ -148,7 +153,13 @@ export function builtInAgentRoutes(db: Db) {
   router.get("/companies/:companyId/built-in-agents", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    await assertBuiltInAgentsEnabled();
+    // Read-only list is safe to serve even when built-in agents are disabled:
+    // the UI polls this unconditionally, so a 404 here produces console noise
+    // and degrades the agents page. Return the empty state instead.
+    if (!(await builtInAgentsEnabled())) {
+      res.json([]);
+      return;
+    }
     const states = await svc.list(companyId);
     res.json(states.map(redactBuiltInAgentListState));
   });

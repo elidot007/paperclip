@@ -125,6 +125,7 @@ export { bootstrapExecutionPolicyFromEnv } from "./execution-policy-bootstrap.js
 export { applyManagedEnvironments } from "./managed-environments.js";
 export { buildExportFidelityReport, collectExportFidelityCounts } from "./export-fidelity.js";
 export { companyPortabilityService } from "./company-portability.js";
+export { companyFactoryService, type CompanyFactoryActor } from "./company-factory.js";
 export { teamsCatalogService } from "./teams-catalog.js";
 export { environmentService } from "./environments.js";
 export {

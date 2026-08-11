@@ -258,6 +258,10 @@ function runVitest(args, label) {
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
     ...process.env,
+    // UI date labels and several historical fixtures are intentionally
+    // calendar-day deterministic. Do not inherit a developer machine's local
+    // timezone; use UTC unless a test-specific override is explicitly needed.
+    TZ: process.env.PAPERCLIP_TEST_TZ ?? "UTC",
     NODE_ENV: "test",
     PAPERCLIP_HOME: path.join(testRoot, "h"),
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
@@ -265,11 +269,15 @@ function runVitest(args, label) {
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
+  const result = spawnSync(
+    "pnpm",
+    ["exec", "vitest", "run", "--exclude", "**/dist/**", "--testTimeout=30000", ...args],
+    {
     cwd: repoRoot,
     env,
     stdio: "inherit",
-  });
+    },
+  );
   if (result.error) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);

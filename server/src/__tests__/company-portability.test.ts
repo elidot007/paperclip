@@ -7,6 +7,14 @@ import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CompanyPortabilityFileEntry } from "@paperclipai/shared";
 
+const { readZipArchive } = vi.hoisted(() => ({
+  readZipArchive: vi.fn(),
+}));
+
+vi.mock("@paperclipai/shared/portability-zip", () => ({
+  readZipArchive,
+}));
+
 const companySvc = {
   getById: vi.fn(),
   create: vi.fn(),
@@ -167,6 +175,7 @@ describe("company portability", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    readZipArchive.mockReset();
     secretSvc.create.mockResolvedValue({ id: "secret-created" });
     secretSvc.remove.mockResolvedValue(true);
     secretSvc.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
@@ -483,6 +492,157 @@ describe("company portability", () => {
       basePath: "gstack",
       companyPath: "gstack/COMPANY.md",
     });
+  });
+
+  it("preserves upstream uppercase AGENTS.md and SKILL.md files during a GitHub package preview", async () => {
+    const rawBase = "https://raw.githubusercontent.com/paperclipai/companies/main/gstack";
+    const treeUrl = "https://api.github.com/repos/paperclipai/companies/git/trees/main?recursive=1";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      const payloadByUrl: Record<string, string> = {
+        [`${rawBase}/COMPANY.md`]: [
+          "---",
+          "name: GStack Import",
+          "slug: gstack-import",
+          "description: A test upstream company package.",
+          "---",
+          "",
+          "# GStack Import",
+        ].join("\n"),
+        [`${rawBase}/agents/ceo/AGENTS.md`]: [
+          "---",
+          "name: CEO",
+          "role: ceo",
+          "skills:",
+          "  - planning",
+          "---",
+          "",
+          "Lead the company.",
+        ].join("\n"),
+        [`${rawBase}/skills/planning/SKILL.md`]: [
+          "---",
+          "name: planning",
+          "description: Plan work.",
+          "---",
+          "",
+          "# Planning",
+        ].join("\n"),
+        [`${rawBase}/.paperclip.yaml`]: [
+          "schema: paperclip/v1",
+          "agents:",
+          "  ceo:",
+          "    adapter:",
+          "      type: codex_local",
+          "    inputs:",
+          "      env:",
+          "        GH_TOKEN:",
+          "          kind: secret",
+          "          requirement: optional",
+          "",
+        ].join("\n"),
+      };
+      if (url === treeUrl) {
+        return new Response(JSON.stringify({
+          tree: [
+            { path: "gstack/agents/ceo/AGENTS.md", type: "blob" },
+            { path: "gstack/skills/planning/SKILL.md", type: "blob" },
+            { path: "gstack/.paperclip.yaml", type: "blob" },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const payload = payloadByUrl[url];
+      return payload === undefined
+        ? new Response("Not found", { status: 404 })
+        : new Response(payload, { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof fetch;
+
+    try {
+      const preview = await companyPortabilityService({} as any).previewImport({
+        source: {
+          type: "github",
+          url: "https://github.com/paperclipai/companies?ref=main&path=gstack",
+        },
+        target: {
+          mode: "new_company",
+          newCompanyName: "GStack Import",
+        },
+      });
+
+      expect(preview.manifest.agents).toEqual([
+        expect.objectContaining({
+          slug: "ceo",
+          name: "CEO",
+          adapterType: "codex_local",
+          skills: ["planning"],
+        }),
+      ]);
+      expect(preview.manifest.skills).toEqual([
+        expect.objectContaining({ slug: "planning", name: "planning" }),
+      ]);
+      expect(preview.manifest.envInputs).toEqual([
+        expect.objectContaining({ agentSlug: "ceo", key: "GH_TOKEN", kind: "secret" }),
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("falls back to the GitHub archive when the tree API is unavailable", async () => {
+    const rawBase = "https://raw.githubusercontent.com/paperclipai/companies/main/gstack";
+    const treeUrl = "https://api.github.com/repos/paperclipai/companies/git/trees/main?recursive=1";
+    const archiveUrl = "https://codeload.github.com/paperclipai/companies/zip/main";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === treeUrl) return new Response("rate limited", { status: 403 });
+      if (url === archiveUrl) return new Response(new Uint8Array([0x50, 0x4b]), { status: 200 });
+      if (url === `${rawBase}/COMPANY.md`) {
+        return new Response("---\nname: Archive fallback\nslug: archive-fallback\n---\n", { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+    readZipArchive.mockResolvedValue({
+      rootPath: "companies-main",
+      files: {
+        "gstack/agents/ceo/AGENTS.md": "---\nname: CEO\nrole: ceo\nskills:\n  - planning\n---\nLead.",
+        "gstack/skills/planning/SKILL.md": "---\nname: planning\ndescription: Plan work.\n---\n# Planning",
+        "gstack/.paperclip.yaml": [
+          "schema: paperclip/v1",
+          "agents:",
+          "  ceo:",
+          "    adapter:",
+          "      type: codex_local",
+          "",
+        ].join("\n"),
+      },
+    });
+
+    try {
+      const preview = await companyPortabilityService({} as any).previewImport({
+        source: {
+          type: "github",
+          url: "https://github.com/paperclipai/companies?ref=main&path=gstack",
+        },
+        target: {
+          mode: "new_company",
+          newCompanyName: "Archive fallback",
+        },
+      });
+
+      expect(readZipArchive).toHaveBeenCalledTimes(1);
+      expect(preview.manifest.agents).toEqual([
+        expect.objectContaining({ slug: "ceo", adapterType: "codex_local", skills: ["planning"] }),
+      ]);
+      expect(preview.manifest.skills).toEqual([
+        expect.objectContaining({ slug: "planning" }),
+      ]);
+      expect(preview.warnings).toContain(
+        "GitHub tree API was unavailable; read the company package from its archive instead.",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("exports referenced skills as stubs by default with sanitized Paperclip extension data", async () => {

@@ -64,6 +64,7 @@ import {
   PERMISSION_KEYS,
 } from "@paperclipai/shared";
 import { sha256HexOfBytes } from "@paperclipai/shared/portability-hash";
+import { readZipArchive } from "@paperclipai/shared/portability-zip";
 import {
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
@@ -72,7 +73,7 @@ import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/serv
 import { findServerAdapter } from "../adapters/index.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
-import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import { ghFetch, gitHubApiBase, isGitHubDotCom, resolveRawGitHubUrl } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
 import { accessService } from "./access.js";
 import { agentService } from "./agents.js";
@@ -2790,6 +2791,23 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function isGitHubPackageCandidatePath(relativePath: string) {
+  const normalizedLowercase = relativePath.toLowerCase();
+  return (
+    normalizedLowercase.endsWith(".md") ||
+    normalizedLowercase.startsWith("skills/") ||
+    normalizedLowercase === ".paperclip.yaml" ||
+    normalizedLowercase === ".paperclip.yml"
+  );
+}
+
+function resolveGitHubArchiveUrl(hostname: string, owner: string, repo: string, ref: string) {
+  const encodedRef = encodeURIComponent(ref);
+  return isGitHubDotCom(hostname)
+    ? `https://codeload.github.com/${owner}/${repo}/zip/${encodedRef}`
+    : `https://${hostname}/${owner}/${repo}/archive/${encodedRef}.zip`;
+}
+
 function dedupeEnvInputs(values: CompanyPortabilityManifest["envInputs"]) {
   const seen = new Set<string>();
   const out: CompanyPortabilityManifest["envInputs"] = [];
@@ -3619,30 +3637,63 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       [companyPath]: companyMarkdown,
     };
     const apiBase = gitHubApiBase(parsed.hostname);
-    const tree = await fetchJson<{ tree?: Array<{ path: string; type: string }> }>(
-      `${apiBase}/repos/${parsed.owner}/${parsed.repo}/git/trees/${ref}?recursive=1`,
-    ).catch(() => ({ tree: [] }));
+    let tree: { tree?: Array<{ path: string; type: string }>; truncated?: boolean } | null = null;
+    let treeError: unknown = null;
+    try {
+      tree = await fetchJson<{ tree?: Array<{ path: string; type: string }>; truncated?: boolean }>(
+        `${apiBase}/repos/${parsed.owner}/${parsed.repo}/git/trees/${ref}?recursive=1`,
+      );
+    } catch (error) {
+      treeError = error;
+    }
     const basePrefix = parsed.basePath ? `${parsed.basePath.replace(/^\/+|\/+$/g, "")}/` : "";
-    const candidatePaths = (tree.tree ?? [])
+    const candidatePaths = (tree?.tree ?? [])
       .filter((entry) => entry.type === "blob")
       .map((entry) => entry.path)
       .filter((entry): entry is string => typeof entry === "string")
       .filter((entry) => {
         if (basePrefix && !entry.startsWith(basePrefix)) return false;
         const relative = basePrefix ? entry.slice(basePrefix.length) : entry;
-        return (
-          relative.endsWith(".md") ||
-          relative.startsWith("skills/") ||
-          relative === ".paperclip.yaml" ||
-          relative === ".paperclip.yml"
-        );
+        return isGitHubPackageCandidatePath(relative);
       });
-    for (const repoPath of candidatePaths) {
-      const relativePath = basePrefix ? repoPath.slice(basePrefix.length) : repoPath;
-      if (files[relativePath] !== undefined) continue;
-      files[normalizePortablePath(relativePath)] = await fetchText(
-        resolveRawGitHubUrl(parsed.hostname, parsed.owner, parsed.repo, ref, repoPath),
-      );
+    if (candidatePaths.length > 0 && !tree?.truncated) {
+      for (const repoPath of candidatePaths) {
+        const relativePath = basePrefix ? repoPath.slice(basePrefix.length) : repoPath;
+        if (files[relativePath] !== undefined) continue;
+        files[normalizePortablePath(relativePath)] = await fetchText(
+          resolveRawGitHubUrl(parsed.hostname, parsed.owner, parsed.repo, ref, repoPath),
+        );
+      }
+    } else {
+      try {
+        const archive = await readZipArchive(
+          await fetchBinary(resolveGitHubArchiveUrl(parsed.hostname, parsed.owner, parsed.repo, ref)),
+        );
+        let importedArchiveFileCount = 0;
+        for (const [archivePath, entry] of Object.entries(archive.files)) {
+          if (basePrefix && !archivePath.startsWith(basePrefix)) continue;
+          const relativePath = basePrefix ? archivePath.slice(basePrefix.length) : archivePath;
+          if (!isGitHubPackageCandidatePath(relativePath)) continue;
+          const normalizedPath = normalizePortablePath(relativePath);
+          if (files[normalizedPath] !== undefined) continue;
+          files[normalizedPath] = entry;
+          importedArchiveFileCount += 1;
+        }
+        if (importedArchiveFileCount === 0) {
+          throw unprocessable("GitHub archive did not contain importable company package files.");
+        }
+        warnings.push(
+          tree?.truncated
+            ? "GitHub tree API returned a truncated listing; read the company package from its archive instead."
+            : "GitHub tree API was unavailable; read the company package from its archive instead.",
+        );
+      } catch (archiveError) {
+        const treeReason = treeError instanceof Error ? treeError.message : null;
+        const archiveReason = archiveError instanceof Error ? archiveError.message : String(archiveError);
+        throw unprocessable(
+          `Could not enumerate the GitHub company package. ${treeReason ? `Tree API: ${treeReason}. ` : ""}Archive fallback: ${archiveReason}`,
+        );
+      }
     }
     const companyDoc = parseFrontmatterMarkdown(companyMarkdown);
     const includeEntries = readIncludeEntries(companyDoc.frontmatter);
@@ -3650,7 +3701,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       const repoPath = [parsed.basePath, includeEntry.path].filter(Boolean).join("/");
       const relativePath = normalizePortablePath(includeEntry.path);
       if (files[relativePath] !== undefined) continue;
-      if (!(repoPath.endsWith(".md") || repoPath.endsWith(".yaml") || repoPath.endsWith(".yml"))) continue;
+      const normalizedLowercase = repoPath.toLowerCase();
+      if (!(normalizedLowercase.endsWith(".md") || normalizedLowercase.endsWith(".yaml") || normalizedLowercase.endsWith(".yml"))) continue;
       files[relativePath] = await fetchText(
         resolveRawGitHubUrl(parsed.hostname, parsed.owner, parsed.repo, ref, repoPath),
       );

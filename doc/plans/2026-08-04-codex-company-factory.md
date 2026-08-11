@@ -53,6 +53,12 @@ Codex is the default runtime for the Board/Meta Orchestrator, project manager, t
 role + reporting line + managed instructions + skill selection + permissions + workspace + runtime adapter
 ```
 
+### Runtime model operations
+
+- The Phase 1 Factory default is `gpt-5.6-luna` on the `codex_local` adapter. It is visible in every reviewable team proposal and may be overridden only through the governed service setting for a future template rollout.
+- Operators can change an existing Agent from **Agent configuration → Model**: the control supports discovered models, refresh, detection and manual model entry. The Factory links directly to this configuration surface after its default is shown.
+- For an Anthropic-compatible endpoint, keep the base URL as a non-secret Agent environment variable and create/bind `ANTHROPIC_API_KEY` through Paperclip Company Secrets. Never place an API key in a Factory request, managed instructions, repository file, plan, issue comment or shell command. Test the agent configuration before assigning production work.
+
 ## 4. Core capabilities
 
 ### 4.1 Intake Router
@@ -190,30 +196,30 @@ Exact paths may be adjusted to current upstream plugin conventions after upgrade
 - [x] Create the `Codex Skill Registry` project with a non-primary local Codex source workspace and a Git-backed primary execution workspace.
 - [x] Synchronize the discoverable local Codex Skills into the Company Skill Library without granting them to all Agents; record audit results before task use.
 - [x] Verify native task-scoped injection with `AIC-3`: a real issue Skill Mention materialized a non-baseline Codex Skill in the Architect's effective `CODEX_HOME/skills`, while the stored `desiredSkills` baseline remained unchanged.
-- [ ] Complete the Agent self-report portion of `AIC-3` after repairing the configured Codex provider credential; the 2026-08-04 runtime reached the adapter but returned `401 Invalid token` before the worker could post its verification comment.
-- [ ] Add `FactoryRequest` and proposal lifecycle.
+- [x] Complete the `AIC-3` verification with a direct Codex-local run: the issue-scoped Skill Mentions materialized while the permanent desired-skill baseline stayed unchanged.
+- [x] Add the persisted company-scoped `FactoryRequest` and explainable proposal lifecycle.
 - [ ] Board Chat creates a structured intake proposal using a Codex Board/Meta Orchestrator.
-- [ ] Add Dev Agency template with Codex PM, engineer, QA and documentation roles.
-- [ ] Provision one project DAG only after an approval interaction.
-- [ ] Apply explicit company skills and managed instructions to provisioned agents.
-- [ ] Produce artifacts and QA acceptance evidence through normal Paperclip work-product flows.
+- [x] Add the Codex Dev Agency template with PM, engineer, QA and documentation roles, all paused/on-demand with `gpt-5.6-luna` as the Factory default.
+- [x] Provision one idempotent project DAG only after a persisted native approval interaction.
+- [x] Apply explicit task-scoped Company Skills and managed instructions to provisioned agents without expanding their permanent skill baselines.
+- [x] Produce an inspectable QA-gated work-product manifest plus project, issue, approval and artifact evidence through normal Paperclip flows.
 
 **Exit gate:** one approved software project is created from Board Chat and reaches a reviewed, reproducible deliverable without manual resource wiring.
 
 ### Phase 2 — Memory Hub and template reuse
 
-- [ ] Add scoped candidate memory records and source provenance.
-- [ ] Inject project/company context before a factory-created agent runs.
-- [ ] Add reviewer promotion and expiry policies.
+- [x] Add scoped candidate memory records and source provenance.
+- [x] Inject project/company context before a factory-created agent runs.
+- [x] Add reviewer promotion and expiry policies.
 - [ ] Add Content Studio and Cross-border Ecom Lite templates.
-- [ ] Add reuse-versus-create planner with explainable scores.
+- [x] Add reuse-versus-create planner with explainable scores.
 
 **Exit gate:** a second project demonstrably reuses approved company/skill/project memory without crossing company boundaries.
 
 ### Phase 3 — Multi-company factory
 
 - [ ] Add capacity planner and organization recommendation logic.
-- [ ] Support new team/new company creation after approval.
+- [x] Support new team/new company creation after approval.
 - [ ] Add governed connector permission manifests and side-effect approval policies.
 - [ ] Add portfolio dashboard showing active companies, projects, work, quality and memory health.
 
@@ -248,8 +254,8 @@ Track the following from the first MVP:
 
 ## 10. Immediate next actions
 
-1. Keep the updated local UI customization, Skill Registry baseline, and this plan committed on the foundation branch.
-2. Repair or replace the configured Codex provider credential, then resume the read-only `AIC-3` verification before creating additional worker Agents.
-3. Implement `AIC-1` through the small vertical slice: request -> proposal -> approval -> Codex Dev Agency project -> QA artifact.
+1. Review the completed `AIC-1` vertical-slice evidence and keep the Factory roles paused until Board work is explicitly assigned.
+2. Use the Factory's **Manage agent models and secret bindings** entry point for model changes; `gpt-5.6-luna` is the current default. Add external-provider credentials only as Company Secrets, then run the built-in configuration test before use.
+3. Add capacity-aware reuse recommendations and a portfolio view; do not bypass the existing request → proposal → native approval seam.
 4. Do not enable a timer heartbeat for the Codex architect; wake only from assigned approved work.
-5. Introduce Memory Hub only after the request/proposal/approval seam is tested.
+5. Add first-class Content Studio and Cross-border Ecom Lite delivery templates only on the same company-scoped context and approval contract.

@@ -112,6 +112,16 @@ export const queryKeys = {
     testRunDetail: (companyId: string, skillId: string, runId: string) =>
       ["company-skills", companyId, skillId, "test-run", runId] as const,
   },
+  companyFactory: {
+    templates: (companyId: string) =>
+      ["company-factory", companyId, "templates"] as const,
+    outcomes: (companyId: string, includeInactive = false) =>
+      ["company-factory", companyId, "outcomes", includeInactive ? "__all" : "__active"] as const,
+    requests: (companyId: string, status?: string) =>
+      ["company-factory", companyId, "requests", status ?? "__all"] as const,
+    request: (companyId: string, requestId: string) =>
+      ["company-factory", companyId, "requests", requestId] as const,
+  },
   teamCatalog: {
     catalog: (filters: { kind?: string; category?: string; q?: string } = {}) =>
       ["team-catalog", "catalog", filters.kind ?? "__all-kinds__", filters.category ?? "__all-categories__", filters.q ?? ""] as const,

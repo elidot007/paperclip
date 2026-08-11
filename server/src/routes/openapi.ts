@@ -23,6 +23,14 @@ import {
   resetAgentSessionSchema,
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
+  // Company Factory
+  factoryCatalogTemplateSelectionSchema,
+  createFactoryOutcomeSchema,
+  createFactoryRequestSchema,
+  factoryIntakeSchema,
+  factoryOutcomeListQuerySchema,
+  factoryRequestListQuerySchema,
+  factoryTemplateAssessmentSchema,
   // Issue
   createIssueSchema,
   updateIssueSchema,
@@ -571,6 +579,119 @@ const importRequestBody = (schema: z.ZodTypeAny) => ({
 });
 
 const r = responses;
+
+const factoryRequestResponseSchema = z.object({
+  id: z.string().uuid(),
+  companyId: z.string().uuid(),
+  title: z.string(),
+  requestMarkdown: z.string(),
+  projectName: z.string(),
+  projectDescription: z.string().nullable(),
+  workspaceCwd: z.string().nullable(),
+  templateSelection: factoryCatalogTemplateSelectionSchema.nullable(),
+  reviewProjectId: z.string().uuid().nullable(),
+  status: z.enum(["draft", "awaiting_approval", "approved", "applying", "applied", "rejected", "blocked", "failed"]),
+  proposal: z.record(z.string(), z.unknown()).nullable(),
+  proposalRevision: z.number().int().nonnegative(),
+  reviewIssueId: z.string().uuid().nullable(),
+  approvalInteractionId: z.string().uuid().nullable(),
+  appliedProjectId: z.string().uuid().nullable(),
+  appliedResources: z.record(z.string(), z.unknown()).nullable(),
+  idempotencyKey: z.string().nullable(),
+  failureReason: z.string().nullable(),
+  createdByAgentId: z.string().uuid().nullable(),
+  createdByUserId: z.string().nullable(),
+  approvedAt: z.string().datetime().nullable(),
+  appliedAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+const factoryOutcomeResponseSchema = z.object({
+  id: z.string().uuid(),
+  companyId: z.string().uuid(),
+  factoryRequestId: z.string().uuid(),
+  projectId: z.string().uuid().nullable(),
+  templateId: z.string().nullable(),
+  title: z.string(),
+  outcomeMarkdown: z.string(),
+  retrospectiveMarkdown: z.string(),
+  evidenceWorkProductIds: z.array(z.string().uuid()),
+  status: z.enum(["awaiting_review", "approved", "rejected"]),
+  activeForReuse: z.boolean(),
+  reviewIssueId: z.string().uuid().nullable(),
+  approvalInteractionId: z.string().uuid().nullable(),
+  createdByUserId: z.string().nullable(),
+  approvedAt: z.string().datetime().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+const factoryTemplateCatalogEntrySchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  sourceUrl: z.string().url().nullable(),
+  category: z.enum(["baseline", "engineering", "research", "security", "product", "creative", "finance", "general"]),
+  importMode: z.enum(["baseline", "direct", "curated_roles", "review_only", "catalog_only"]),
+  expectedAgentCount: z.number().int().nonnegative(),
+  expectedSkillCount: z.number().int().nonnegative(),
+  requiresReview: z.boolean(),
+}).strict();
+
+const factoryTemplateAssessmentResponseSchema = z.object({
+  generatedAt: z.string().datetime(),
+  inputSummary: z.string(),
+  templateCandidates: z.array(z.object({
+    template: factoryTemplateCatalogEntrySchema,
+    score: z.number().int().nonnegative(),
+    matchedSignals: z.array(z.string()),
+    rationale: z.string(),
+  }).strict()),
+  existingCompanyCandidates: z.array(z.object({
+    companyId: z.string().uuid(),
+    name: z.string(),
+    description: z.string().nullable(),
+    score: z.number().int().nonnegative(),
+    matchedSignals: z.array(z.string()),
+    rationale: z.string(),
+  }).strict()),
+  recommendation: z.object({
+    action: z.enum(["reuse_existing_company", "import_template_new_company", "compose_template_roles", "create_baseline_company"]),
+    templateId: z.string().nullable(),
+    existingCompanyId: z.string().uuid().nullable(),
+    requiresApproval: z.literal(true),
+    externalSideEffectsBlocked: z.literal(true),
+    rationale: z.string(),
+  }).strict(),
+}).strict();
+
+const factoryIntakeResponseSchema = z.object({
+  interpretedAt: z.string().datetime(),
+  deterministic: z.literal(true),
+  businessRequest: z.string(),
+  normalizedRequest: z.object({
+    title: z.string(),
+    projectName: z.string(),
+    requestMarkdown: z.string(),
+    capabilitySignals: z.array(z.string()),
+    constraintSignals: z.array(z.string()),
+    interpretationNotes: z.array(z.string()),
+  }).strict(),
+  assessment: factoryTemplateAssessmentResponseSchema,
+  suggestedTemplateSelection: factoryCatalogTemplateSelectionSchema.nullable(),
+  reuseBoundary: z.object({
+    existingCompanyId: z.string().uuid().nullable(),
+    automatedAttachment: z.literal(false),
+    rationale: z.string(),
+  }).strict(),
+  governance: z.object({
+    createsResources: z.literal(false),
+    requiresApprovalForProvisioning: z.literal(true),
+    externalSideEffectsBlocked: z.literal(true),
+  }).strict(),
+}).strict();
 
 const externalObjectSummariesBodySchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
@@ -4488,6 +4609,102 @@ registry.registerPath({
 });
 
 // ─── Company skills ───────────────────────────────────────────────────────────
+
+// ─── Company Factory ──────────────────────────────────────────────────────────
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/factory/templates",
+  tags: ["company-factory"],
+  summary: "List curated AI Company Factory templates",
+  responses: { 200: r.ok(z.array(factoryTemplateCatalogEntrySchema)), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/templates/assess",
+  tags: ["company-factory"],
+  summary: "Assess explainable company/template reuse candidates without mutation",
+  body: factoryTemplateAssessmentSchema,
+  responses: { 200: r.ok(factoryTemplateAssessmentResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/intake",
+  tags: ["company-factory"],
+  summary: "Normalize one business brief and assess Factory reuse without mutation",
+  body: factoryIntakeSchema,
+  responses: { 200: r.ok(factoryIntakeResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/factory/outcomes",
+  tags: ["company-factory"],
+  summary: "List company-scoped approved Factory outcome memory",
+  query: factoryOutcomeListQuerySchema,
+  responses: { 200: r.ok(z.array(factoryOutcomeResponseSchema)), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/factory/requests",
+  tags: ["company-factory"],
+  summary: "List governed Company Factory requests",
+  query: factoryRequestListQuerySchema,
+  responses: { 200: r.ok(z.array(factoryRequestResponseSchema)), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/requests",
+  tags: ["company-factory"],
+  summary: "Create a governed Company Factory request",
+  body: createFactoryRequestSchema,
+  responses: { 201: r.ok(factoryRequestResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/requests/{requestId}/outcomes",
+  tags: ["company-factory"],
+  summary: "Submit QA-backed Factory outcome and retrospective for Board review",
+  body: createFactoryOutcomeSchema,
+  responses: { 201: r.ok(factoryOutcomeResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/outcomes/{outcomeId}/promote",
+  tags: ["company-factory"],
+  summary: "Promote an accepted Factory outcome to company-local reusable memory",
+  responses: { 200: r.ok(factoryOutcomeResponseSchema), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/factory/requests/{requestId}",
+  tags: ["company-factory"],
+  summary: "Get a Company Factory request",
+  responses: { 200: r.ok(factoryRequestResponseSchema), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/requests/{requestId}/propose",
+  tags: ["company-factory"],
+  summary: "Generate a reviewable Company Factory proposal",
+  responses: { 200: r.ok(factoryRequestResponseSchema), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/factory/requests/{requestId}/apply",
+  tags: ["company-factory"],
+  summary: "Apply an accepted Company Factory proposal",
+  responses: { 200: r.ok(factoryRequestResponseSchema), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
 
 registry.registerPath({
   method: "get",

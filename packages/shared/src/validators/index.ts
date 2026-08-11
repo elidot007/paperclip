@@ -66,6 +66,25 @@ export {
   type UpdateCompanyBranding,
 } from "./company.js";
 export {
+  factoryRequestStatusSchema,
+  factoryOutcomeStatusSchema,
+  createFactoryRequestSchema,
+  createFactoryOutcomeSchema,
+  factoryIntakeSchema,
+  factoryRequestListQuerySchema,
+  factoryOutcomeListQuerySchema,
+  factoryCatalogTemplateSelectionSchema,
+  factoryTemplateTargetSchema,
+  factoryTemplateAssessmentSchema,
+  type CreateFactoryRequest,
+  type CreateFactoryOutcome,
+  type FactoryOutcomeListQuery,
+  type FactoryIntakeInput,
+  type FactoryCatalogTemplateSelectionInput,
+  type FactoryRequestListQuery,
+  type FactoryTemplateAssessmentInput,
+} from "./company-factory.js";
+export {
   environmentDriverSchema,
   environmentStatusSchema,
   environmentLeaseStatusSchema,

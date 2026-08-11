@@ -1,0 +1,1 @@
+ALTER TABLE "company_factory_requests" ADD COLUMN "template_selection" jsonb;

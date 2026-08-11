@@ -18618,7 +18618,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const run = typeof runOrLookup === "string" ? await getRunLogAccess(runOrLookup) : runOrLookup;
       const runId = typeof runOrLookup === "string" ? runOrLookup : runOrLookup.id;
       if (!run) throw notFound("Heartbeat run not found");
-      if (!run.logStore || !run.logRef) throw notFound("Run log not found");
+      // A run that never produced a log (e.g. cancelled before the log store was
+      // opened) has no logStore/logRef. The UI polls run logs unconditionally,
+      // so 404 here produces console noise for a state that is not an error.
+      // Return an empty log instead; `nextOffset` stays undefined so a later
+      // poll re-checks (a log may appear once the run actually starts).
+      if (!run.logStore || !run.logRef) {
+        return { runId, store: null, logRef: null, content: "", nextOffset: undefined };
+      }
 
       const result = await runLogStore.read(
         {
