@@ -51,6 +51,32 @@ function sanitizeRemoteClaudeSettings(raw: string): string {
   delete settings.mcpServers;
   delete settings.permissionMode;
   delete settings.skipDangerousModePermissionPrompt;
+  // Never let a host-side claude settings.env (e.g. a proxy manager writing
+  // ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY) leak into
+  // an agent-managed run: the agent's own adapterConfig.env (including
+  // secret_ref bindings) is the only credential source for Paperclip runs.
+  // Keeping host proxy/base-url values here silently overrides that and can
+  // route agent traffic through an operator proxy with stale credentials.
+  if (settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)) {
+    const env = { ...(settings.env as Record<string, unknown>) };
+    for (const key of [
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+      "ANTHROPIC_MODEL",
+      "CLAUDE_CODE_USE_BEDROCK",
+    ]) {
+      delete env[key];
+    }
+    settings.env = env;
+  }
   return JSON.stringify(settings);
 }
 

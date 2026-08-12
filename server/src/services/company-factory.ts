@@ -99,6 +99,31 @@ const FACTORY_DEFAULT_MODEL =
   process.env.PAPERCLIP_FACTORY_DEFAULT_MODEL?.trim()
   || process.env.PAPERCLIP_FACTORY_CODEX_MODEL?.trim()
   || "deepseek-v4-flash";
+
+// Optional operator-provided default env bindings merged into every Factory
+// team agent's adapterConfig.env at provisioning time. Without this, a fresh
+// claude_local team has no ANTHROPIC_* config and every first run fails with
+// "Authentication required" until an operator manually injects env per agent.
+// Expected shape is a JSON object of env binding maps, e.g.
+//   PAPERCLIP_FACTORY_CLAUDE_ENV_JSON='{"ANTHROPIC_BASE_URL":{"type":"plain","value":"https://…"},"ANTHROPIC_AUTH_TOKEN":{"type":"plain","value":"…"}}'
+// Values may be plain strings (shorthand for {type:"plain",value}) or full
+// binding objects (including secret-ref bindings).
+function parseFactoryClaudeEnv(): Record<string, unknown> | undefined {
+  const raw = process.env.PAPERCLIP_FACTORY_CLAUDE_ENV_JSON?.trim();
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const entries = Object.entries(parsed).map(([key, value]) => [
+      key,
+      typeof value === "string" ? { type: "plain" as const, value } : value,
+    ]);
+    return Object.fromEntries(entries) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+const FACTORY_CLAUDE_ENV = parseFactoryClaudeEnv();
 const APPLY_RETRY_AFTER_MS = 60_000;
 const FACTORY_SHARED_CONTEXT_MAX_ENTRIES = 3;
 const FACTORY_SHARED_CONTEXT_EXCERPT_LENGTH = 900;
@@ -1121,6 +1146,7 @@ export function companyFactoryService(db: Db) {
           timeoutSec: FACTORY_RUN_TIMEOUT_SEC,
           maxTurnsPerRun: FACTORY_RUN_MAX_TURNS,
           dangerouslyBypassApprovalsAndSandbox: false,
+          ...(FACTORY_CLAUDE_ENV ? { env: FACTORY_CLAUDE_ENV } : {}),
           paperclipSkillSync: {
             desiredSkills: uniqueSkills(input.proposal.team.find((teamRole) => teamRole.key === input.role)?.baselineSkills ?? [])
               .map((skill) => skill.key),
