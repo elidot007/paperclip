@@ -1,5 +1,13 @@
 # Codex-first Company Factory: Master Implementation Plan
 
+> **Runtime update (2026-08-11):** The Factory now provisions agents on the
+> `claude_local` adapter with `deepseek-v4-flash` as the default model, matching
+> the operator's deployed runtime. `codex_local` / `gpt-5.6-luna` references
+> below describe the original codex-first Phase 1 decision and are superseded
+> by `server/src/services/company-factory.ts` (`FACTORY_DEFAULT_MODEL`).
+> Template key `codex_dev_agency` remains unchanged for persisted-data
+> compatibility.
+
 **Date:** 2026-08-04
 **Status:** Active foundation plan
 **Owner:** Board / Codex

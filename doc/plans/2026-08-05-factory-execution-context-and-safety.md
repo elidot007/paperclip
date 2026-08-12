@@ -1,5 +1,10 @@
 # AI Company Factory: Safe Runtime Normalization and Reusable Execution Context
 
+> **Runtime update (2026-08-11):** The Factory runtime is `claude_local` +
+> `deepseek-v4-flash` (supersedes the `codex_local` + `gpt-5.6-luna` values in
+> the slices below). All safety properties still hold: agents remain paused,
+> heartbeats off, no credentials, bypass flag disabled.
+
 **Status:** implementation complete; live safety remediation verified  
 **Owner:** Board / Company Factory  
 **Scope:** complete the next governed Factory capability after catalog, import,

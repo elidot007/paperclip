@@ -1,5 +1,10 @@
 # AI Company Factory: Companies Catalog, Reuse, and Governed Provisioning
 
+> **Runtime update (2026-08-11):** Imported agents are normalized to the
+> `claude_local` adapter with `deepseek-v4-flash` (supersedes the earlier
+> `codex_local` + `gpt-5.6-luna` normalization described below), still paused,
+> with no credentials and no agent/Skill creation permission.
+
 **Status:** implementation complete; governed rollout ready  
 **Owner:** Board / Company Factory  
 **Scope:** turn the existing Factory request → proposal → approval → provision kernel into the first usable slice of the user's broader “AI Company Factory” objective.

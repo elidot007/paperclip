@@ -61,6 +61,8 @@ import {
   statusCardService,
   toolAccessService,
 } from "./services/index.js";
+import { factoryAutopilotService } from "./services/factory-autopilot.js";
+import { agentService } from "./services/agents.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -952,6 +954,15 @@ export async function startServer(): Promise<StartedServer> {
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
+    const factoryAutopilot = factoryAutopilotService(db as any, {
+      wakeup: heartbeat.wakeup,
+      resumeAgent: async (agentId: string) => {
+        const resumed = await agentService(db as any).resume(agentId);
+        return resumed ? { id: resumed.id } : null;
+      },
+      listDependencyReadiness: (companyId: string, issueIds: string[]) =>
+        issues.listDependencyReadiness(companyId, issueIds),
+    });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1147,6 +1158,18 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "routine scheduler tick failed");
+          }));
+
+        if (heartbeatSchedulerStopped) return;
+        trackHeartbeatSchedulerWork(factoryAutopilot
+          .tick(new Date())
+          .then((result) => {
+            if (result.woken > 0 || result.resumed > 0) {
+              logger.info({ ...result }, "factory autopilot tick woke agents");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "factory autopilot tick failed");
           }));
 
         if (heartbeatSchedulerStopped) return;

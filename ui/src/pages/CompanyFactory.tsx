@@ -799,7 +799,7 @@ function FactoryRequestDetail(input: {
                   {proposal.team.map((role) => (
                     <div key={role.key} className="rounded-lg border p-3 text-sm">
                       <div className="font-medium">{role.title}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">Codex · {role.model ?? "gpt-5.6-luna"} · managed instructions · starts paused</div>
+                      <div className="mt-1 text-xs text-muted-foreground">Claude · {role.model ?? "deepseek-v4-flash"} · managed instructions · starts paused</div>
                     </div>
                   ))}
                 </div>

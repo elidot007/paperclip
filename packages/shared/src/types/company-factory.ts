@@ -226,7 +226,7 @@ export interface FactoryTeamRoleProposal {
   reportsTo: FactoryTeamRoleKey | "company_ceo" | null;
   baselineSkills: FactorySkillReference[];
   managedInstructions: true;
-  adapterType: "codex_local";
+  adapterType: "claude_local" | "codex_local";
   model: string;
   startsPaused: true;
 }

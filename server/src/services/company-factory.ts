@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import { stat } from "node:fs/promises";
+import { promisify } from "node:util";
 import path from "node:path";
+
+const execFile = promisify(execFileCallback);
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -86,10 +90,15 @@ type FactoryRoleSpec = {
 
 const FACTORY_TEMPLATE_KEY = "codex_dev_agency" as const;
 const FACTORY_CATALOG_IMPORT_TEMPLATE_KEY = "catalog_company_import" as const;
-// The Factory is Codex-first. Keep a single clear Luna default while allowing
-// an operator to override it in the service environment for a future governed
-// template rollout.
-const FACTORY_CODEX_MODEL = process.env.PAPERCLIP_FACTORY_CODEX_MODEL?.trim() || "gpt-5.6-luna";
+// The Factory runs claude_local against the operator's Anthropic-compatible
+// endpoint (deepseek-v4-flash by default). Keep a single clear default while
+// allowing an operator to override it in the service environment for a future
+// governed template rollout. PAPERCLIP_FACTORY_CODEX_MODEL is accepted as a
+// deprecated alias for the original codex-first default.
+const FACTORY_DEFAULT_MODEL =
+  process.env.PAPERCLIP_FACTORY_DEFAULT_MODEL?.trim()
+  || process.env.PAPERCLIP_FACTORY_CODEX_MODEL?.trim()
+  || "deepseek-v4-flash";
 const APPLY_RETRY_AFTER_MS = 60_000;
 const FACTORY_SHARED_CONTEXT_MAX_ENTRIES = 3;
 const FACTORY_SHARED_CONTEXT_EXCERPT_LENGTH = 900;
@@ -97,28 +106,28 @@ const FACTORY_SHARED_CONTEXT_EXCERPT_LENGTH = 900;
 const FACTORY_ROLE_SPECS: Record<FactoryTeamRoleKey, FactoryRoleSpec> = {
   project_manager: {
     agentRole: "pm",
-    label: "Codex PM",
+    label: "Claude PM",
     title: "Project Manager",
     capabilities: "Breaks approved work into an auditable delivery plan, maintains task dependencies, and escalates governance decisions without bypassing them.",
     reportsTo: "company_ceo",
   },
   software_engineer: {
     agentRole: "engineer",
-    label: "Codex Engineer",
+    label: "Claude Engineer",
     title: "Software Engineer",
     capabilities: "Implements approved changes in the assigned workspace, records reproducible evidence, and does not perform external side effects without a separate approval.",
     reportsTo: "project_manager",
   },
   qa_reviewer: {
     agentRole: "qa",
-    label: "Codex QA",
+    label: "Claude QA",
     title: "QA Reviewer",
     capabilities: "Independently verifies acceptance criteria and artifacts, records failures, and gates completion on reproducible QA evidence.",
     reportsTo: "project_manager",
   },
   documentation: {
     agentRole: "general",
-    label: "Codex Docs",
+    label: "Claude Docs",
     title: "Documentation Lead",
     capabilities: "Produces a concise, inspectable handoff from accepted artifacts and preserves the project operating context without writing cross-company memory.",
     reportsTo: "project_manager",
@@ -147,6 +156,7 @@ const FACTORY_TASK_SPECS: Array<{
       "Turn the approved factory request into a bounded execution plan.",
       "Confirm that implementation, QA, and documentation tasks retain their dependency and artifact gates.",
       "Record unresolved decisions as approval interactions rather than making external changes.",
+      "When the plan approval interaction is accepted, update this issue to done so downstream tasks unlock.",
     ],
   },
   {
@@ -355,21 +365,9 @@ function sourceFilesDigest(files: Record<string, CompanyPortabilityFileEntry>): 
 function catalogImportAdapterConfig(workspaceCwd: string): Record<string, unknown> {
   return {
     cwd: workspaceCwd,
-    model: FACTORY_CODEX_MODEL,
-    engine: "cli",
-    modelReasoningEffort: "xhigh",
+    model: FACTORY_DEFAULT_MODEL,
     timeoutSec: 1_800,
     dangerouslyBypassApprovalsAndSandbox: false,
-    extraArgs: [
-      "--disable",
-      "hooks",
-      "--disable",
-      "memories",
-      "--disable",
-      "goals",
-      "--disable",
-      "multi_agent",
-    ],
   };
 }
 
@@ -500,7 +498,7 @@ function renderProposalDocument(input: { request: FactoryRequest; proposal: Fact
       `- Action: ${proposal.project.willCreate ? "create a new project" : `reuse project ${proposal.project.id}`}`,
       `- Workspace: ${proposal.project.workspaceCwd ?? "not yet supplied"}`,
       "",
-      "## Codex Dev Agency",
+      "## Claude Dev Agency",
       roleRows,
       "",
       renderSharedContext(proposal.sharedContext),
@@ -644,6 +642,7 @@ function factoryAgentInstructions(input: {
     "- Keep activity, artifacts, and context inside this company and project. You may use only approved company-local Factory outcome memory; do not read or write cross-company memory.",
     "- Do not purchase, publish, deploy, alter credentials, call external write connectors, or take destructive actions without an explicit Board approval interaction tied to the task.",
     "- Record blockers and QA evidence in Paperclip; do not bypass an approval or QA gate.",
+    "- When an approval interaction you created is accepted, finish the handoff: update the issue to its completed status and post the acceptance summary, so dependent tasks can unlock.",
   ].join("\n");
 }
 
@@ -820,7 +819,7 @@ export function companyFactoryService(db: Db) {
       );
     }
     if (!input.request.workspaceCwd) {
-      throw unprocessable("A catalog template import requires an existing absolute local workspace path for its paused Codex agents.");
+      throw unprocessable("A catalog template import requires an existing absolute local workspace path for its paused Claude agents.");
     }
     const workspaceCwd = await validateWorkspaceCwd(input.request.workspaceCwd);
     const sourceCompany = await ensureCompany(input.companyId);
@@ -925,7 +924,7 @@ export function companyFactoryService(db: Db) {
         `${importPlan.templateName} was selected explicitly from the curated Company Template Catalog and passed an agent-safe, read-only preview.`,
         `The proposal pins the reviewed source snapshot as ${importPlan.sourceDigest}; a changed upstream package must be re-proposed before application.`,
         `The import will ${importPlan.target.mode === "new_company" ? `create a new company named "${importPlan.target.companyName}"` : `add a renamed, non-destructive copy to the current company "${importPlan.target.companyName}"`}.`,
-        `All ${importPlan.selectedAgentSlugs.length} imported agents receive an explicit Codex Local ${FACTORY_CODEX_MODEL} configuration, start paused, and receive no credential values or agent/Skill creation permission.`,
+        `All ${importPlan.selectedAgentSlugs.length} imported agents receive an explicit Claude Local ${FACTORY_DEFAULT_MODEL} configuration, start paused, and receive no credential values or agent/Skill creation permission.`,
         importPlan.importMode === "review_only"
           ? "This is a review-only source template: native Board approval is required and no external/security side effect is authorized by this proposal."
           : "The template is a curated direct import candidate, but native Board approval and all external-action controls remain required.",
@@ -984,8 +983,8 @@ export function companyFactoryService(db: Db) {
         reportsTo: spec.reportsTo,
         baselineSkills: input.skills.baseline,
         managedInstructions: true,
-        adapterType: "codex_local",
-        model: FACTORY_CODEX_MODEL,
+        adapterType: "claude_local",
+        model: FACTORY_DEFAULT_MODEL,
         startsPaused: true,
       };
     });
@@ -1002,8 +1001,8 @@ export function companyFactoryService(db: Db) {
       "The Factory request is explicitly scoped to the current Paperclip company; no company, memory, connector, or artifact boundary is crossed.",
       exactProject
         ? `Active project \"${exactProject.name}\" exactly matches the requested project name, so the proposal reuses it instead of creating a duplicate.`
-        : `No active project exactly matches \"${input.request.projectName}\", so the proposal creates one Codex Dev Agency project team.`,
-      "The team contains a Codex PM, engineer, QA reviewer, and documentation role with managed instructions and only a minimal persistent Paperclip baseline.",
+        : `No active project exactly matches \"${input.request.projectName}\", so the proposal creates one Claude Dev Agency project team.`,
+      "The team contains a Claude PM, engineer, QA reviewer, and documentation role with managed instructions and only a minimal persistent Paperclip baseline.",
       "Every task names run-scoped Skills in its Task Skill Manifest; provisioned agents start paused and no task is started by this proposal.",
       input.sharedContext.rationale,
       "The QA task blocks the documentation handoff, and all external side effects remain outside this approval.",
@@ -1068,6 +1067,25 @@ export function companyFactoryService(db: Db) {
     return workspaceCwd;
   }
 
+  // A fresh Factory workspace is only a directory on disk — createWorkspace writes
+  // a DB row but never initializes git. claude_local (and other git-sensitive local
+  // adapters) refuse to launch from a cwd without .git metadata, so the first run on
+  // a brand-new Factory workspace would fail validation before the agent could do
+  // anything. Initializing an empty repo here is idempotent and unblocks first run.
+  // A directory that already belongs to a checkout (e.g. a reused company workspace)
+  // is left untouched.
+  async function ensureWorkspaceIsGitRepo(workspaceCwd: string): Promise<void> {
+    try {
+      await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: workspaceCwd });
+      return;
+    } catch {
+      // Not inside a work tree — initialize an empty repo so adapter workspace
+      // validation passes. Deliberately no user.name/email: the agent run will
+      // configure its own committer identity for the commits it creates.
+      await execFile("git", ["init", "-q"], { cwd: workspaceCwd });
+    }
+  }
+
   async function createOrRecoverFactoryAgent(input: {
     request: FactoryRequest;
     proposal: FactoryProposal;
@@ -1088,24 +1106,12 @@ export function companyFactoryService(db: Db) {
         title: spec.title,
         reportsTo: input.reportsTo,
         capabilities: spec.capabilities,
-        adapterType: "codex_local",
+        adapterType: "claude_local",
         adapterConfig: {
           cwd: input.workspaceCwd,
-          model: FACTORY_CODEX_MODEL,
-          engine: "cli",
-          modelReasoningEffort: "xhigh",
+          model: FACTORY_DEFAULT_MODEL,
           timeoutSec: 1_800,
           dangerouslyBypassApprovalsAndSandbox: false,
-          extraArgs: [
-            "--disable",
-            "hooks",
-            "--disable",
-            "memories",
-            "--disable",
-            "goals",
-            "--disable",
-            "multi_agent",
-          ],
           paperclipSkillSync: {
             desiredSkills: uniqueSkills(input.proposal.team.find((teamRole) => teamRole.key === input.role)?.baselineSkills ?? [])
               .map((skill) => skill.key),
@@ -1322,7 +1328,7 @@ export function companyFactoryService(db: Db) {
       }
       const adapterOverrides = Object.fromEntries(
         prepared.importPlan.selectedAgentSlugs.map((slug) => [slug, {
-          adapterType: "codex_local",
+          adapterType: "claude_local",
           adapterConfig: catalogImportAdapterConfig(prepared.workspaceCwd),
         }]),
       );
@@ -1402,7 +1408,7 @@ export function companyFactoryService(db: Db) {
       };
       delete safeAdapterConfig.env;
       const updated = await agentsSvc.update(importedAgent.id, {
-        adapterType: "codex_local",
+        adapterType: "claude_local",
         adapterConfig: safeAdapterConfig,
         runtimeConfig: {
           ...existingRuntimeConfig,
@@ -1874,7 +1880,7 @@ export function companyFactoryService(db: Db) {
         throw unprocessable("Factory workspaceCwd must be an absolute local path.");
       }
       if (templateSelection && !workspaceCwd) {
-        throw unprocessable("A catalog template request requires an absolute local workspace path for its paused Codex agents.");
+        throw unprocessable("A catalog template request requires an absolute local workspace path for its paused Claude agents.");
       }
       if (templateSelection?.target === "new_company" && !actor.isInstanceAdmin) {
         throw forbidden("Creating a company from a Factory template requires an instance administrator.");
@@ -2009,13 +2015,13 @@ export function companyFactoryService(db: Db) {
         title: `Approve Factory proposal: ${current.title}`,
         summary: resolvedProposal.catalogImport
           ? `Approve the reviewed ${resolvedProposal.catalogImport.templateName} template import. External side effects remain blocked.`
-          : "Approve internal Codex Dev Agency provisioning. External side effects remain blocked.",
+          : "Approve internal Claude Dev Agency provisioning. External side effects remain blocked.",
         continuationPolicy: "none",
         payload: {
           version: 1,
           prompt: resolvedProposal.catalogImport
-            ? `Approve this Factory proposal to import the reviewed ${resolvedProposal.catalogImport.templateName} architecture with paused Codex agents and no credentials?`
-            : "Approve this Factory proposal to provision the internal project, paused Codex roles, and QA-gated issue DAG?",
+            ? `Approve this Factory proposal to import the reviewed ${resolvedProposal.catalogImport.templateName} architecture with paused Claude agents and no credentials?`
+            : "Approve this Factory proposal to provision the internal project, paused Claude roles, and QA-gated issue DAG?",
           acceptLabel: "Approve provisioning",
           rejectLabel: "Reject proposal",
           rejectRequiresReason: true,
@@ -2148,6 +2154,9 @@ export function companyFactoryService(db: Db) {
           });
           if (!workspace) throw unprocessable("Factory could not create the requested project workspace.");
           projectWorkspaceId = workspace.id;
+          // Brand-new Factory workspaces are empty directories; give them git
+          // metadata so claude_local's first run passes workspace validation.
+          await ensureWorkspaceIsGitRepo(workspaceCwd);
           await logActivity(db, {
             companyId,
             actorType: "user",
@@ -2290,7 +2299,7 @@ export function companyFactoryService(db: Db) {
             reviewState: "needs_board_review",
             isPrimary: true,
             healthStatus: "healthy",
-            summary: "Inspectable record that this Factory request created a paused Codex team and QA-gated issue graph. It is not a substitute for the QA verdict required by the QA task.",
+            summary: "Inspectable record that this Factory request created a paused Claude team and QA-gated issue graph. It is not a substitute for the QA verdict required by the QA task.",
             metadata: {
               factoryRequestId: request.id,
               factoryTemplateKey: proposal.templateKey,

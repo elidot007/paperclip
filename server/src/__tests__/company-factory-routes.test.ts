@@ -275,7 +275,7 @@ describeEmbeddedPostgres("company factory routes", () => {
     expect(proposal.body.status).toBe("awaiting_approval");
     expect(proposal.body.proposal.recommendation).toBe("create_project_team");
     expect(proposal.body.proposal.team).toHaveLength(4);
-    expect(proposal.body.proposal.team.every((role: { model?: string }) => role.model === "gpt-5.6-luna")).toBe(true);
+    expect(proposal.body.proposal.team.every((role: { model?: string }) => role.model === "deepseek-v4-flash")).toBe(true);
     expect(proposal.body.proposal.sharedContext).toEqual(expect.objectContaining({ entries: [] }));
     expect(proposal.body.reviewIssueId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(proposal.body.approvalInteractionId).toMatch(/^[0-9a-f-]{36}$/i);
@@ -312,8 +312,8 @@ describeEmbeddedPostgres("company factory routes", () => {
 
     const team = await db.select().from(agents).where(eq(agents.companyId, companyId));
     expect(team).toHaveLength(4);
-    expect(team.every((agent) => agent.adapterType === "codex_local" && agent.status === "paused")).toBe(true);
-    expect(team.every((agent) => (agent.adapterConfig as Record<string, unknown>).model === "gpt-5.6-luna")).toBe(true);
+    expect(team.every((agent) => agent.adapterType === "claude_local" && agent.status === "paused")).toBe(true);
+    expect(team.every((agent) => (agent.adapterConfig as Record<string, unknown>).model === "deepseek-v4-flash")).toBe(true);
     expect(team.every((agent) => (agent.adapterConfig as Record<string, unknown>).dangerouslyBypassApprovalsAndSandbox === false)).toBe(true);
     expect(team.every((agent) => (agent.adapterConfig as Record<string, unknown>).instructionsBundleMode === "managed")).toBe(true);
     const manager = team.find((agent) => agent.role === "pm");
@@ -550,7 +550,7 @@ describeEmbeddedPostgres("company factory routes", () => {
       expect(importedAgent).toBeTruthy();
       expect(importedAgent).toEqual(expect.objectContaining({
         name: "CEO",
-        adapterType: "codex_local",
+        adapterType: "claude_local",
         status: "paused",
         pauseReason: "system",
         permissions: {
@@ -560,7 +560,7 @@ describeEmbeddedPostgres("company factory routes", () => {
       }));
       expect(importedAgent?.adapterConfig).toEqual(expect.objectContaining({
         cwd: workspaceCwd,
-        model: "gpt-5.6-luna",
+        model: "deepseek-v4-flash",
         dangerouslyBypassApprovalsAndSandbox: false,
         instructionsBundleMode: "managed",
       }));
