@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import path from "node:path";
 
@@ -102,6 +102,12 @@ const FACTORY_DEFAULT_MODEL =
 const APPLY_RETRY_AFTER_MS = 60_000;
 const FACTORY_SHARED_CONTEXT_MAX_ENTRIES = 3;
 const FACTORY_SHARED_CONTEXT_EXCERPT_LENGTH = 900;
+// Bound each Factory agent run so a finished-but-hung Claude CLI process
+// cannot hold a run open indefinitely. maxTurnsPerRun makes the CLI exit
+// cleanly with max_turns_exhausted once the work is done (or truly stuck),
+// and timeoutSec is the hard kill after SIGTERM/SIGKILL escalation.
+const FACTORY_RUN_MAX_TURNS = 60;
+const FACTORY_RUN_TIMEOUT_SEC = 1_200;
 
 const FACTORY_ROLE_SPECS: Record<FactoryTeamRoleKey, FactoryRoleSpec> = {
   project_manager: {
@@ -366,7 +372,8 @@ function catalogImportAdapterConfig(workspaceCwd: string): Record<string, unknow
   return {
     cwd: workspaceCwd,
     model: FACTORY_DEFAULT_MODEL,
-    timeoutSec: 1_800,
+    timeoutSec: FACTORY_RUN_TIMEOUT_SEC,
+    maxTurnsPerRun: FACTORY_RUN_MAX_TURNS,
     dangerouslyBypassApprovalsAndSandbox: false,
   };
 }
@@ -1072,18 +1079,19 @@ export function companyFactoryService(db: Db) {
   // adapters) refuse to launch from a cwd without .git metadata, so the first run on
   // a brand-new Factory workspace would fail validation before the agent could do
   // anything. Initializing an empty repo here is idempotent and unblocks first run.
-  // A directory that already belongs to a checkout (e.g. a reused company workspace)
-  // is left untouched.
+  // A directory that already has its own .git is left untouched.
+  // NOTE: must mirror heartbeat's hasGitMetadata semantics (direct cwd/.git probe),
+  // NOT `git rev-parse` — Factory workspaces commonly live inside the company
+  // workspace git repo, so an upward walk would report "inside a work tree" for a
+  // directory that still has no local .git and skip the init.
   async function ensureWorkspaceIsGitRepo(workspaceCwd: string): Promise<void> {
-    try {
-      await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: workspaceCwd });
-      return;
-    } catch {
-      // Not inside a work tree — initialize an empty repo so adapter workspace
-      // validation passes. Deliberately no user.name/email: the agent run will
-      // configure its own committer identity for the commits it creates.
-      await execFile("git", ["init", "-q"], { cwd: workspaceCwd });
-    }
+    const hasLocalGitMetadata = await lstat(path.resolve(workspaceCwd, ".git"))
+      .then((entry) => entry.isDirectory() || entry.isFile())
+      .catch(() => false);
+    if (hasLocalGitMetadata) return;
+    // Deliberately no user.name/email: the agent run will configure its own
+    // committer identity for the commits it creates.
+    await execFile("git", ["init", "-q"], { cwd: workspaceCwd });
   }
 
   async function createOrRecoverFactoryAgent(input: {
@@ -1110,7 +1118,8 @@ export function companyFactoryService(db: Db) {
         adapterConfig: {
           cwd: input.workspaceCwd,
           model: FACTORY_DEFAULT_MODEL,
-          timeoutSec: 1_800,
+          timeoutSec: FACTORY_RUN_TIMEOUT_SEC,
+          maxTurnsPerRun: FACTORY_RUN_MAX_TURNS,
           dangerouslyBypassApprovalsAndSandbox: false,
           paperclipSkillSync: {
             desiredSkills: uniqueSkills(input.proposal.team.find((teamRole) => teamRole.key === input.role)?.baselineSkills ?? [])
