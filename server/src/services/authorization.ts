@@ -495,24 +495,45 @@ function activeResponsibleUserCanAuthorizeIssueAction(
   );
 }
 
-function activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
+function activeResponsibleUserCanAuthorizeAgentGrantedConfigChange(
   action: AuthorizationAction,
   membership: ResponsibleUserSnapshot["activeMembership"],
   agentDecision: AuthorizationDecision,
   actorAgentId: string | null | undefined,
 ) {
-  return Boolean(
-    action === "skill_config:update" &&
-    membership &&
-    membership.status === "active" &&
-    membership.membershipRole !== "viewer" &&
-    agentDecision.allowed &&
-    (agentDecision.reason === "allow_direct_change" || agentDecision.reason === "allow_consented_change") &&
-    agentDecision.grant?.principalType === "agent" &&
-    agentDecision.grant.principalId === actorAgentId &&
-    (agentDecision.grant.permissionKey === "skills:create" ||
-      agentDecision.grant.permissionKey === "skills:suggest-changes"),
-  );
+  const membershipOk = Boolean(membership && membership.status === "active" && membership.membershipRole !== "viewer");
+  if (!membershipOk || !agentDecision.allowed) return false;
+
+  if (action === "agent_config:read") {
+    // Self-reads: the bundle is already in the agent's bootstrap context,
+    // so passing them through the intersection reveals nothing new.
+    if (agentDecision.reason === "allow_self") return true;
+    // Instruction preflight reads: the same grant that lets the agent
+    // propose a config change must let it read the target bundle first,
+    // or a consented proposal can never be applied (AUT-723).
+    return Boolean(
+      agentDecision.grant?.principalType === "agent" &&
+      agentDecision.grant.principalId === actorAgentId &&
+      (agentDecision.grant.permissionKey === "agents:suggest-changes" ||
+        agentDecision.grant.permissionKey === "agents:configure"),
+    );
+  }
+
+  if (action === "skill_config:update" || action === "agent_config:update") {
+    if (agentDecision.reason !== "allow_direct_change" && agentDecision.reason !== "allow_consented_change") {
+      return false;
+    }
+    return Boolean(
+      agentDecision.grant?.principalType === "agent" &&
+      agentDecision.grant.principalId === actorAgentId &&
+      (agentDecision.grant.permissionKey === "skills:create" ||
+        agentDecision.grant.permissionKey === "skills:suggest-changes" ||
+        agentDecision.grant.permissionKey === "agents:configure" ||
+        agentDecision.grant.permissionKey === "agents:suggest-changes"),
+    );
+  }
+
+  return false;
 }
 
 function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: string) {
@@ -2146,17 +2167,22 @@ export function authorizationService(db: Db) {
         : "RESPONSIBLE_USER_UNAVAILABLE";
 
     if (
-      activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
+      activeResponsibleUserCanAuthorizeAgentGrantedConfigChange(
         input.action,
         snapshot.activeMembership,
         agentDecision,
         input.actor.agentId,
       )
     ) {
-      // Skill mutations are governed by the agent's explicit skill-change
-      // grant. The responsible-user intersection still requires an active
-      // non-viewer user, but does not require duplicating that grant on the
-      // responsible user's board account for standard heartbeat JWTs.
+      // Skill/agent mutations are governed by the agent's explicit
+      // change grant (direct or consented); instruction reads by the
+      // same grant are the preflight for those proposals. The
+      // responsible-user intersection still requires an active
+      // non-viewer user, but does not require duplicating that grant
+      // on the responsible user's board account — built-in routine
+      // actors (e.g. `built-in-bundles`) are not board users and hold
+      // no role grants, so recomputing decideBase for them denied
+      // every consented coaching-card apply (AUT-723).
       return agentDecision;
     }
 
