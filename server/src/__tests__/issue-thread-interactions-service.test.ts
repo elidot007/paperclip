@@ -631,6 +631,43 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("keeps a pending card when an ops system_notice supersedes it (AUT-735)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Ops notice must not supersede");
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the weekly policy?",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    // Reproduces the AUT-56 watchdog: an ops alert posted with the board API key has an
+    // authorUserId and no run id, so it used to read as a human and expire the card in
+    // under five minutes — before the Board ever saw it.
+    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByComment({
+      id: issueId,
+      companyId,
+    }, {
+      id: randomUUID(),
+      createdAt: new Date(new Date(created.createdAt).getTime() + 1_000),
+      authorUserId: "local-board",
+      createdByRunId: null,
+      presentation: { kind: "system_notice" },
+    }, {
+      userId: "local-board",
+    });
+
+    expect(expired).toHaveLength(0);
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows[0]?.status).toBe("pending");
+  });
+
   it("keeps ask_user_questions pending when user-comment supersede is explicitly disabled", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Question supersede opt-out");
 

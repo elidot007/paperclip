@@ -11,6 +11,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
+  isClaudeModelNotFoundFailure,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -51,6 +52,44 @@ describe("isClaudeModelNotFoundError", () => {
     expect(isClaudeModelNotFoundError({
       errorMessage: "API Error: 503 service unavailable",
     })).toBe(false);
+  });
+});
+
+describe("isClaudeModelNotFoundFailure", () => {
+  // AUT-735, reproduced from the real AUT-726 runs. A `--resume`d session's stdout
+  // quotes the previous turn, and the previous turn's run was itself stamped
+  // `model_not_found`. The raw regex matches that quoted text, so a run that died
+  // at the turn cap was stamped `model_not_found`; the platform then read it as a
+  // missing key, set `wakePolicy: manual_repair_required`, and enqueued no wake.
+  it("does not let a quoted model_not_found in resumed stdout beat this run's own turn-cap verdict", () => {
+    const quotedPreviousRun = JSON.stringify({
+      run: "348bfdfb",
+      errorCode: "model_not_found",
+      note: "the run before this one was stamped model_not_found",
+    });
+
+    expect(isClaudeModelNotFoundError({
+      parsed: { subtype: "error_max_turns", is_error: true, stopReason: "max_turns_exhausted", num_turns: 61 },
+      stdout: `Reading prior transcript…\n${quotedPreviousRun}\nReached turn limit.`,
+    })).toBe(true); // the raw regex really does match the quoted text
+
+    expect(isClaudeModelNotFoundFailure({
+      parsed: { subtype: "error_max_turns", is_error: true, stopReason: "max_turns_exhausted", num_turns: 61 },
+      stdout: `Reading prior transcript…\n${quotedPreviousRun}\nReached turn limit.`,
+    })).toBe(false); // …but the structured turn-cap verdict wins
+  });
+
+  it("still reports a genuine model resolution failure when the run did not hit the turn cap", () => {
+    expect(isClaudeModelNotFoundFailure({
+      parsed: { subtype: "error", result: "API Error: 404 model not found: claude-haiku-4-6" },
+    })).toBe(true);
+  });
+
+  it("falls back to the raw check when there is no parsed result to prefer", () => {
+    expect(isClaudeModelNotFoundFailure({
+      parsed: null,
+      stdout: "API Error: 404 model not found: claude-haiku-4-6",
+    })).toBe(true);
   });
 });
 

@@ -236,6 +236,30 @@ export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | 
   );
 }
 
+/**
+ * AUT-735: the model-not-found regexes run over the *entire* run stdout, and a
+ * `--resume`d session's stdout quotes the previous turn. When that quoted turn
+ * happened to contain another run's `"errorCode": "model_not_found"`, a run that
+ * actually died at the turn cap was stamped `model_not_found`. The platform reads
+ * that as a missing key: `isConfigurationIncompleteFailedRun` treats it as
+ * configuration-incomplete, recovery sets `wakePolicy: manual_repair_required`, and
+ * `enqueueSourceScopedStrandedRecoveryWake` returns early — so *no wake is enqueued*
+ * and the issue sits blocked until a human sweeps it.
+ *
+ * A structured turn-cap verdict from this run's own result event is authoritative,
+ * so it wins over a substring match on quoted text. With no parsed result there is
+ * no structured verdict to prefer, so this degrades to `isClaudeModelNotFoundError`.
+ */
+export function isClaudeModelNotFoundFailure(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  if (isClaudeMaxTurnsResult(input.parsed ?? null)) return false;
+  return isClaudeModelNotFoundError(input);
+}
+
 export function isClaudeRefusalResult(parsed: Record<string, unknown> | null | undefined): boolean {
   if (!parsed) return false;
 

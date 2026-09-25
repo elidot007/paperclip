@@ -68,7 +68,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
-  isClaudeModelNotFoundError,
+  isClaudeModelNotFoundFailure,
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
@@ -1002,7 +1002,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
-        : isClaudeModelNotFoundError({
+        : isClaudeModelNotFoundFailure({
           parsed: null,
           stdout: proc.stdout,
           stderr: proc.stderr,
@@ -1135,15 +1135,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
-      : failed && isClaudeModelNotFoundError({
+      : failed && clearSessionForMaxTurns
+      ? "max_turns_exhausted"
+      : failed && isClaudeModelNotFoundFailure({
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       })
       ? "model_not_found"
-      : failed && clearSessionForMaxTurns
-      ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
       : providerQuota

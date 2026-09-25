@@ -1821,13 +1821,24 @@ export function issueThreadInteractionService(db: Db) {
 
     expireRequestConfirmationsSupersededByComment: async (
       issue: { id: string; companyId: string },
-      comment: { id: string; createdAt: Date | string; authorUserId?: string | null; createdByRunId?: string | null },
+      comment: {
+        id: string;
+        createdAt: Date | string;
+        authorUserId?: string | null;
+        createdByRunId?: string | null;
+        presentation?: { kind?: string | null } | null;
+      },
       actor: InteractionActor,
     ) => {
       if (!comment.authorUserId) return [];
       // Local-CLI adapters post under user auth, so authorUserId can't tell a human from a
       // machine; createdByRunId can. Only genuine human comments (no run context) supersede.
       if (comment.createdByRunId) return [];
+      // AUT-735: out-of-band ops posters (e.g. a watchdog posting alerts with a board API
+      // key) have no run context, so the check above reads them as human and silently
+      // expired a pending decision card within minutes — a card the Board never saw. A
+      // `system_notice` is by definition not a decision on the card, so it cannot supersede.
+      if (comment.presentation?.kind === "system_notice") return [];
 
       const rows = await db
         .select()
