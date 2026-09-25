@@ -44,6 +44,7 @@ import {
   type RunProcessResult,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
+import { openLocalRunLogChannel, type LocalRunLogChannelHandle } from "./local-run-log-channel.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import { runWithoutActiveStep } from "./acpx-engine/startup-timing.js";
@@ -225,6 +226,15 @@ function resolveDefaultPaperclipApiUrl(): string {
 function isBridgeDebugEnabled(env: NodeJS.ProcessEnv): boolean {
   const value = env.PAPERCLIP_BRIDGE_DEBUG?.trim().toLowerCase();
   return value === "1" || value === "true" || value === "yes";
+}
+
+// Local runs default to file-backed stdout/stderr (see local-run-log-channel)
+// so a server restart cannot kill an in-flight run through a closed pipe.
+// `PAPERCLIP_LOCAL_RUN_LOG_CHANNEL=off` restores the historical pipe transport
+// for a single run if the tail loop ever misbehaves on a new host.
+function localRunLogChannelEnabled(env: NodeJS.ProcessEnv): boolean {
+  const value = env.PAPERCLIP_LOCAL_RUN_LOG_CHANNEL?.trim().toLowerCase();
+  return value !== "0" && value !== "off" && value !== "false" && value !== "no";
 }
 
 function isAdapterExecutionTargetInstance(value: unknown): value is AdapterExecutionTarget {
@@ -621,18 +631,35 @@ export async function runAdapterExecutionTargetProcess(
       ? sanitizeRemoteExecutionEnv(options.env)
       : options.env;
 
-  return await runChildProcess(runId, command, args, {
-    cwd: options.cwd,
-    env,
-    stdin: options.stdin,
-    timeoutSec: options.timeoutSec,
-    graceSec: options.graceSec,
-    onLog: options.onLog,
-    onSpawn: options.onSpawn,
-    terminalResultCleanup: options.terminalResultCleanup,
-    localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
-    remoteExecution: adapterExecutionTargetToRemoteSpec(target),
-  });
+  // Local runs get file-backed stdout/stderr so a server restart does not turn
+  // the child's next write into SIGPIPE. This is what makes the hot-restart
+  // adoption report honest: without a re-attachable output channel, an adopted
+  // run dies seconds after the report calls it alive.
+  const isLocalRun = !target || target.kind === "local";
+  let outputLogChannel: LocalRunLogChannelHandle | null = null;
+  if (isLocalRun && localRunLogChannelEnabled(options.env)) {
+    outputLogChannel = await openLocalRunLogChannel({ runId }).catch(() => null);
+  }
+
+  try {
+    return await runChildProcess(runId, command, args, {
+      cwd: options.cwd,
+      env,
+      stdin: options.stdin,
+      timeoutSec: options.timeoutSec,
+      graceSec: options.graceSec,
+      onLog: options.onLog,
+      onSpawn: options.onSpawn,
+      terminalResultCleanup: options.terminalResultCleanup,
+      localProcessSandbox: isLocalRun ? options.localProcessSandbox : null,
+      remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+      outputLogChannel,
+    });
+  } finally {
+    // runChildProcess already closed the channel; this is the belt-and-braces
+    // path for a spawn that threw before it took ownership.
+    await outputLogChannel?.close();
+  }
 }
 
 export async function runAdapterExecutionTargetShellCommand(

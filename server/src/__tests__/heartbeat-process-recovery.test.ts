@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { and, eq, or, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { openLocalRunLogChannel } from "@paperclipai/adapter-utils/local-run-log-channel";
 import {
   activityLog,
   agents,
@@ -1430,6 +1431,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   }
 
+  // Adoption requires a re-attachable output channel, not just a live pid: a
+  // pipe-backed run keeps its pid after the server that owned the read ends
+  // exits and dies on its next write. Call inside withTempPaperclipHome so the
+  // channel lands in the same instance root the reconcile reads.
+  async function seedFileBackedRunChannel(runId: string, pid: number) {
+    const channel = await openLocalRunLogChannel({ runId });
+    await channel.bind({ pid, processGroupId: pid, startedAt: new Date().toISOString() });
+    await channel.close();
+  }
+
   it("captures a hot-restart shutdown snapshot without interrupting running runs", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
@@ -1501,6 +1512,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     await withTempPaperclipHome(async (home) => {
+      await seedFileBackedRunChannel(runId, child.pid as number);
       await writeHotRestartIntent({
         previousServerPid: process.pid,
         previousServerVersion: "old-home-root-version",
@@ -1705,6 +1717,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     await withTempPaperclipHome(async (home) => {
+      await seedFileBackedRunChannel(runId, spawnedPid);
       await writeHotRestartIntent({
         previousServerPid: process.pid,
         previousServerVersion: "old-version",
@@ -1732,7 +1745,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           expect.objectContaining({
             runId,
             classification: "adopted",
-            reason: "process_pid_alive",
+            reason: "output_channel_file_backed_process_pid_alive",
           }),
         ]),
       );
@@ -1761,6 +1774,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await withTempPaperclipHome(async (home) => {
       const heartbeat = heartbeatService(db);
+      await seedFileBackedRunChannel(runId, child.pid as number);
       await writeHotRestartIntent({
         previousServerPid: process.pid,
         previousServerVersion: "old-version",
@@ -1817,6 +1831,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("reports a live pipe-backed run as lost instead of adopted", async () => {
+    // The false green light: the pid is alive, but its stdout/stderr were
+    // pipes owned by the server that just exited, so the run dies on its next
+    // write. Reporting it `adopted` here is a green light for a run that is
+    // already doomed.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      const heartbeat = heartbeatService(db);
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        lostRunIds: [runId],
+      });
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs?: Array<Record<string, unknown>> };
+      expect(report.runs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            runId,
+            classification: "lost",
+            reason: "output_channel_descriptor_missing",
+          }),
+        ]),
+      );
+    });
+  });
+
   it.skipIf(process.platform === "win32")("keeps process-group-only hot-restart adoptions out of process_lost reaping", async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
@@ -1829,6 +1892,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await withTempPaperclipHome(async () => {
       const heartbeat = heartbeatService(db);
+      await seedFileBackedRunChannel(runId, orphan.processPid);
       await writeHotRestartIntent({
         previousServerPid: process.pid,
         previousServerVersion: "old-version",
@@ -1867,6 +1931,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           processGroupId: orphan.processGroupId,
         },
       });
+    });
+  });
+
+  it("never retries an adopted run when its process is later lost", async () => {
+    // Adoption means a previous server handed the run over mid-flight, so the
+    // child already did — or was midway through — the work. Re-dispatching it
+    // repeats side effects (a duplicate comment, a second publish) for a run
+    // whose real outcome is simply unknown. The loss must be reported instead.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      await seedFileBackedRunChannel(runId, child.pid as number);
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+
+      // The adopted child now exits on its own. The reap path must finalize
+      // the run, not schedule a second execution of it.
+      child.kill("SIGKILL");
+      await waitForPidExit(child.pid as number);
+      expect(isPidAlive(child.pid as number)).toBe(false);
+
+      const reap = await heartbeat.reapOrphanedRuns();
+      expect(reap).toEqual({ reaped: 1, runIds: [runId] });
+
+      const lost = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(lost?.status).toBe("failed");
+      expect(lost?.errorCode).toBe("process_lost");
+      expect(lost?.error).not.toContain("retrying once");
+
+      // No re-dispatch: the wake queue must not gain a process_lost_retry for
+      // a run that was already adopted once.
+      const retries = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.reason, "process_lost_retry"))
+        .then((rows) => rows);
+      expect(retries).toEqual([]);
     });
   });
 

@@ -262,6 +262,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { inspectLocalRunLogChannel } from "@paperclipai/adapter-utils/local-run-log-channel";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -10193,6 +10194,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
+      // A live pid is NOT sufficient to adopt. A pipe-backed run keeps its pid
+      // after the server that owned the read ends exits, and dies on its next
+      // write — reporting it `adopted` here is the false green light: the
+      // report says green and the run dies seconds later. Only a run whose
+      // stdout/stderr are file-backed can be re-attached by this server, so
+      // that is the bar for `adopted`.
+      const outputChannel = await inspectLocalRunLogChannel(candidate.runId);
+      if (!outputChannel.live) {
+        classify(candidate, "lost", outputChannel.reason, patch);
+        continue;
+      }
+
       const resultJson = mergeHotRestartAdoptionResultJson(parseObject(run.resultJson), {
         adoptedAt: now,
         previousServerPid: intent.previousServerPid,
@@ -10242,7 +10255,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId,
         },
       });
-      classify(candidate, "adopted", processPidAlive ? "process_pid_alive" : "process_group_alive", patch);
+      classify(candidate, "adopted", `${outputChannel.reason}_${processPidAlive ? "process_pid_alive" : "process_group_alive"}`, patch);
     }
 
     const report = await writeHotRestartReport({
@@ -12901,7 +12914,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
-      const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
+      const wasAdopted = readHotRestartAdoptionMetadata(parseObject(run.resultJson)) !== null;
+      // Never retry a hot-restart-adopted run. Adoption means a previous server
+      // handed this run over mid-flight, so the child already did (or was
+      // midway through) the work; re-dispatching it repeats side effects —
+      // a duplicate comment, a second publish — for a run whose real outcome is
+      // simply unknown. Report the loss and let the wake policy decide.
+      const shouldRetry = !wasAdopted && (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );

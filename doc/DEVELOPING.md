@@ -148,6 +148,22 @@ look like a zero-loss restart.
 
 A healthy guarded deploy must compare the report against `/api/health` (`version` or `serverVersion`) and treat any `lostRunIds` entry as a continuity failure that needs recovery before marking deployment complete.
 
+### The service unit must not kill the runs it is trying to adopt
+
+`systemctl restart <unit>` with the systemd default `KillMode=control-group`
+SIGTERMs every process in the unit's cgroup, so the in-flight children die
+before the new server starts and the snapshot has nothing left to adopt. No
+output-channel change helps here — a file-backed child still dies on an
+explicit SIGTERM. The unit needs `KillMode=process` (or `mixed`, which
+SIGTERMs only the main process and SIGKILLs the rest after
+`TimeoutStopSec`). `doc/systemd/paperclip-hot-restart.conf` is a ready-made
+drop-in, with the cleanup trade-off spelled out. Check what a unit is actually
+using before trusting a report:
+
+```sh
+systemctl --user show <unit>.service -p KillMode
+```
+
 ### Recovering a deploy blocked by missing process metadata
 
 If the currently installed version already has a running local-agent heartbeat

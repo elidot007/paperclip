@@ -10,6 +10,11 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import {
+  backfillLocalRunLogTail,
+  createLocalRunLogTail,
+  type LocalRunLogChannelHandle,
+} from "./local-run-log-channel.js";
 import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
@@ -3198,6 +3203,14 @@ export async function runChildProcess(
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    /**
+     * File-backed stdout/stderr channel (see `local-run-log-channel.ts`).
+     * When set for a LOCAL run, the child's stdio are the write ends of two
+     * regular files instead of pipes, so the run survives the server exiting:
+     * a pipe reader going away turns the child's next write into SIGPIPE.
+     * Ignored for remote (SSH) execution, which has its own transport.
+     */
+    outputLogChannel?: LocalRunLogChannelHandle | null;
   },
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
@@ -3236,15 +3249,30 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // A file-backed channel only makes sense for a child this process
+        // spawns locally; the SSH transport owns its own remote stdio.
+        const outputLogChannel = opts.remoteExecution ? null : opts.outputLogChannel ?? null;
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [
+            opts.stdin != null ? "pipe" : "ignore",
+            outputLogChannel ? outputLogChannel.stdoutFd : "pipe",
+            outputLogChannel ? outputLogChannel.stderrFd : "pipe",
+          ],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
+
+        // The descriptor is what a post-hot-restart server reads to re-attach,
+        // so it must name the pid before this run can ever be adopted.
+        const channelBindPromise = outputLogChannel && typeof child.pid === "number" && child.pid > 0
+          ? outputLogChannel
+              .bind({ pid: child.pid, processGroupId, startedAt })
+              .catch((err) => onLogError(err, runId, "failed to bind local run log channel"))
+          : Promise.resolve();
 
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
@@ -3325,36 +3353,44 @@ export async function runChildProcess(
               }, opts.timeoutSec * 1000)
             : null;
 
+        const handleOutputChunk = (stream: "stdout" | "stderr", text: string) => {
+          if (stream === "stdout") stdout = appendWithCap(stdout, text);
+          else stderr = appendWithCap(stderr, text);
+          maybeArmTerminalResultCleanup();
+          logChain = logChain
+            .then(() => opts.onLog(stream, text))
+            .catch((err) => onLogError(err, runId, `failed to append ${stream} log chunk`))
+            .finally(() => maybeArmTerminalResultCleanup());
+        };
+
         child.stdout?.on("data", (chunk: unknown) => {
           const readable = child.stdout;
           if (!readable) return;
           readable.pause();
-          const text = String(chunk);
-          stdout = appendWithCap(stdout, text);
-          maybeArmTerminalResultCleanup();
-          logChain = logChain
-            .then(() => opts.onLog("stdout", text))
-            .catch((err) => onLogError(err, runId, "failed to append stdout log chunk"))
-            .finally(() => {
-              maybeArmTerminalResultCleanup();
-              resumeReadable(readable);
-            });
+          handleOutputChunk("stdout", String(chunk));
+          resumeReadable(readable);
         });
 
         child.stderr?.on("data", (chunk: unknown) => {
           const readable = child.stderr;
           if (!readable) return;
           readable.pause();
-          const text = String(chunk);
-          stderr = appendWithCap(stderr, text);
-          maybeArmTerminalResultCleanup();
-          logChain = logChain
-            .then(() => opts.onLog("stderr", text))
-            .catch((err) => onLogError(err, runId, "failed to append stderr log chunk"))
-            .finally(() => {
-              maybeArmTerminalResultCleanup();
-              resumeReadable(readable);
-            });
+          handleOutputChunk("stderr", String(chunk));
+          resumeReadable(readable);
+        });
+
+        // File-backed runs never populate child.stdout/stderr (the fds are the
+        // log files), so a byte-offset tail loop feeds the same pipeline. The
+        // loop stops in the close handler below, and the backfill there emits
+        // anything the tail missed so the adapter still sees its full output.
+        const outputLogTail = outputLogChannel
+          ? createLocalRunLogTail({
+              stdoutPath: outputLogChannel.stdoutPath,
+              stderrPath: outputLogChannel.stderrPath,
+            })
+          : null;
+        outputLogTail?.start(async (stream, text) => {
+          handleOutputChunk(stream, text);
         });
 
         const stdin = child.stdin;
@@ -3400,32 +3436,53 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
-              resolve({
-                exitCode: code,
-                signal,
-                timedOut,
-                stdout,
-                stderr,
-                pid: child.pid ?? null,
-                startedAt,
-                terminalResultCleanup: terminalCleanupStarted
-                  ? {
-                    kind: "terminal_result_cleanup",
-                    stopped: true,
-                    stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                    reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                    terminalResultSeen,
-                    signal: terminalCleanupSignal,
-                    forceKilled: terminalCleanupForceKilled,
-                  }
-                  : null,
+          void channelBindPromise
+            .catch(() => undefined)
+            .then(() => outputLogTail?.stop() ?? Promise.resolve())
+            .then(() =>
+              outputLogChannel && outputLogTail
+                ? backfillLocalRunLogTail({
+                    stdoutPath: outputLogChannel.stdoutPath,
+                    stderrPath: outputLogChannel.stderrPath,
+                    consumed: outputLogTail.consumedBytes(),
+                    onLog: async (stream, text) => {
+                      handleOutputChunk(stream, text);
+                    },
+                  })
+                : undefined,
+            )
+            .catch(() => undefined)
+            .then(() => {
+              void outputLogChannel?.close();
+            })
+            .finally(() => {
+              void logChain.finally(() => {
+                void Promise.resolve()
+                  .then(() => target.cleanup?.())
+                  .finally(() => {
+                    resolve({
+                      exitCode: code,
+                      signal,
+                      timedOut,
+                      stdout,
+                      stderr,
+                      pid: child.pid ?? null,
+                      startedAt,
+                      terminalResultCleanup: terminalCleanupStarted
+                        ? {
+                          kind: "terminal_result_cleanup",
+                          stopped: true,
+                          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+                          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+                          terminalResultSeen,
+                          signal: terminalCleanupSignal,
+                          forceKilled: terminalCleanupForceKilled,
+                        }
+                        : null,
+                    });
+                  });
               });
-              });
-          });
+            });
         });
       })
       .catch(reject);
