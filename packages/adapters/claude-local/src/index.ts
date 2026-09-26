@@ -22,11 +22,16 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use Claude Sonnet as the lower-cost Claude Code lane while preserving the agent's primary model.",
-    adapterConfig: {
-      model: "claude-sonnet-4-6",
-      effort: "low",
-    },
+    // AUT-906/AUT-989: a built-in `model` here is a fail-open. A missing or empty
+    // runtimeConfig.modelProfiles.cheap slot resolves to enabled:true, so the merge
+    // below is what actually lands on the wire — and a Claude id named here overrides
+    // the agent's own lane for EVERY agent whose slot is unconfigured. This fleet's
+    // upstream serves no Claude ids, so that default is a 401, not a cheaper run.
+    // The cheap lane therefore inherits whatever model the agent is configured with
+    // and only takes effect once an agent names a cheaper id in its own slot.
+    description:
+      "Use an explicitly configured lower-cost Claude model without changing the primary model. The default is empty on purpose: an unconfigured cheap slot inherits the agent's own model rather than overriding it with an id this adapter cannot know is served.",
+    adapterConfig: {},
     source: "adapter_default",
   },
 ];
