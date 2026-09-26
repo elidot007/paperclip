@@ -731,6 +731,28 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+
+/**
+ * Whether a heartbeat run can still act as an execution owner.
+ *
+ * `scheduled_retry` is a placeholder, not an execution. It records that a retry
+ * is pending; every path that resolves one either cancels it or spawns a
+ * separate run, and none promotes it to `queued` or `running`. It therefore
+ * never holds a process and never will, so it must not be read as a live owner:
+ * doing so locks the issue permanently, because every PATCH and release then
+ * 409s against a run that cannot act and the issue can never be re-dispositioned
+ * or re-assigned.
+ *
+ * `queued` and `running` stay live owners. A `queued` run has not started yet,
+ * but it will, and clearing its lock would hand the issue to a second run.
+ */
+export function heartbeatRunCanOwnExecution(
+  run: { status: string } | null | undefined,
+): boolean {
+  if (!run) return false;
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+  return run.status !== "scheduled_retry";
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -891,7 +913,7 @@ async function resolveAcceptedPlanClaimOwner(input: {
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.claim.ownerRunId))
     .then((rows) => rows[0] ?? null);
-  if (existingOwnerRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingOwnerRun.status)) {
+  if (heartbeatRunCanOwnExecution(existingOwnerRun)) {
     return {
       ownerAgentId: input.claim.ownerAgentId,
       ownerUserId: input.claim.ownerUserId,
@@ -4767,8 +4789,8 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+      const stale = !heartbeatRunCanOwnExecution(existingRun);
+      const actorLive = heartbeatRunCanOwnExecution(actorRun);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -4831,7 +4853,7 @@ export function issueService(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
-      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
+      if (!heartbeatRunCanOwnExecution(actorRun)) return null;
 
       const now = new Date();
       const adopted = await tx
@@ -4884,7 +4906,7 @@ export function issueService(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (heartbeatRunCanOwnExecution(run)) return false;
 
       const updated = await tx
         .update(issues)
@@ -7809,15 +7831,21 @@ export function issueService(db: Db) {
         && (candidate.executionRunId == null || candidate.executionRunId === actorRunId)
       );
 
+      type OwnershipCandidate = {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      };
+      type OwnershipResolution = {
+        ownership: (OwnershipCandidate & { adoptedFromRunId: string | null }) | null;
+        latest: OwnershipCandidate | null;
+      };
+
       const resolveOwnership = async (
-        candidate: {
-          id: string;
-          status: string;
-          assigneeAgentId: string | null;
-          checkoutRunId: string | null;
-          executionRunId: string | null;
-        },
-      ) => {
+        candidate: OwnershipCandidate,
+      ): Promise<OwnershipResolution> => {
         const sameRunOwnership = resolveSameRunOwnership(candidate);
         if (sameRunOwnership) return { ownership: sameRunOwnership, latest: null };
 
@@ -7836,6 +7864,32 @@ export function issueService(db: Db) {
               },
               latest: null,
             };
+          }
+        }
+
+        if (
+          actorRunId &&
+          candidate.status === "in_progress" &&
+          candidate.assigneeAgentId === actorAgentId &&
+          candidate.checkoutRunId == null &&
+          candidate.executionRunId != null &&
+          candidate.executionRunId !== actorRunId
+        ) {
+          // A foreign executionRunId with no checkoutRunId is the shape a run
+          // that was scheduled but never started leaves behind: it names an
+          // owner while holding no process. Every other recovery path is keyed
+          // on checkoutRunId, so without this the issue 409s forever against a
+          // run that cannot act. clearExecutionRunIfTerminal is a no-op while
+          // that run can still own execution, so a live owner keeps its 409 —
+          // and because the row is then unchanged we must not re-resolve, or
+          // this branch would recurse on itself until the request times out.
+          if (await clearExecutionRunIfTerminal(id)) {
+            const afterClear = await loadCurrent();
+            if (afterClear) {
+              const reowned = await resolveOwnership(afterClear);
+              if (reowned.ownership) return { ownership: reowned.ownership, latest: null };
+              if (reowned.latest) return { ownership: null, latest: reowned.latest };
+            }
           }
         }
 

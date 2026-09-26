@@ -535,4 +535,108 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  // A `scheduled_retry` run is a placeholder for a pending retry, not an
+  // execution: it never starts and every resolution path cancels it. It is not
+  // terminal either, so a status-only ownership test calls it live and the issue
+  // 409s forever against a run that cannot act. `queued` is the opposite case and
+  // is pinned below — it has not started but it will, so its lock must hold.
+  it("lets the assignee PATCH past a scheduled_retry execution owner", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const placeholderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: placeholderRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "manual",
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: new Date(Date.now() + 3_600_000),
+      scheduledRetryAttempt: 4,
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "scheduled_retry execution owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: placeholderRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Recovered scheduled_retry owner" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Recovered scheduled_retry owner",
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+  });
+
+  it.each(["queued" as const, "running" as const])(
+    "still returns 409 when a %s execution owner is a real future execution",
+    async (liveOwnerStatus) => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const liveOwnerRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveOwnerRunId,
+        companyId,
+        agentId,
+        status: liveOwnerStatus,
+        invocationSource: "manual",
+        startedAt: liveOwnerStatus === "running" ? new Date() : null,
+        finishedAt: null,
+      });
+
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `${liveOwnerStatus} execution owner`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: liveOwnerRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Should not be applied" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue run ownership conflict");
+
+      const row = await db
+        .select({ title: issues.title, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        title: `${liveOwnerStatus} execution owner`,
+        executionRunId: liveOwnerRunId,
+      });
+    },
+  );
 });
