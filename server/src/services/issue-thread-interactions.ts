@@ -258,6 +258,17 @@ function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSuperse
   return interaction.payload.supersedeOnUserComment === true;
 }
 
+// AUT-735: out-of-band ops posters (e.g. a watchdog posting alerts with a board API key) have
+// an authorUserId and no run context, so "human comment" checks read them as human and silently
+// expired a pending decision card within minutes — a card the Board never saw. A `system_notice`
+// is by definition not a decision on the card, so it cannot supersede, on the live path or on the
+// historical backfill (AUT-921: the backfill used to miss this and re-expire the AUT-56 card).
+function isSupersedingUserCommentPresentable(comment: {
+  presentation?: { kind?: string | null } | null;
+} | null | undefined): boolean {
+  return comment?.presentation?.kind !== "system_notice";
+}
+
 function normalizeCreateInteractionInput(input: CreateIssueThreadInteraction): CreateIssueThreadInteraction {
   switch (input.kind) {
     case "ask_user_questions":
@@ -1834,11 +1845,11 @@ export function issueThreadInteractionService(db: Db) {
       // Local-CLI adapters post under user auth, so authorUserId can't tell a human from a
       // machine; createdByRunId can. Only genuine human comments (no run context) supersede.
       if (comment.createdByRunId) return [];
-      // AUT-735: out-of-band ops posters (e.g. a watchdog posting alerts with a board API
-      // key) have no run context, so the check above reads them as human and silently
-      // expired a pending decision card within minutes — a card the Board never saw. A
-      // `system_notice` is by definition not a decision on the card, so it cannot supersede.
-      if (comment.presentation?.kind === "system_notice") return [];
+      // AUT-735/AUT-921: out-of-band ops posters (e.g. a watchdog posting alerts with a board API
+      // key) have no run context, so the check above reads them as human and silently expired a
+      // pending decision card within minutes — a card the Board never saw. A `system_notice` is by
+      // definition not a decision on the card, so it cannot supersede.
+      if (!isSupersedingUserCommentPresentable(comment)) return [];
 
       const rows = await db
         .select()
@@ -1918,7 +1929,10 @@ export function issueThreadInteractionService(db: Db) {
           .orderBy(asc(issueComments.createdAt)),
       ]);
 
-      if (rows.length === 0 || comments.length === 0) return [];
+      // AUT-921: presentation is jsonb, so it can't be filtered in SQL; drop ops `system_notice`
+      // comments here, matching what the live path already refuses to treat as a supersede.
+      const supersedingComments = comments.filter((comment) => isSupersedingUserCommentPresentable(comment));
+      if (rows.length === 0 || supersedingComments.length === 0) return [];
 
       const now = new Date();
       const expired: IssueThreadInteraction[] = [];
@@ -1934,7 +1948,7 @@ export function issueThreadInteractionService(db: Db) {
         const interaction = hydrateInteraction(row) as UserCommentSupersedableInteraction;
         if (!shouldSupersedeInteractionOnUserComment(interaction)) continue;
 
-        const supersedingComment = comments.find((comment) => isCommentAtOrAfterInteraction({
+        const supersedingComment = supersedingComments.find((comment) => isCommentAtOrAfterInteraction({
           commentCreatedAt: comment.createdAt,
           interactionCreatedAt: row.createdAt,
         }));

@@ -56,7 +56,7 @@ import {
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
-import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { HttpError, conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -82,6 +82,15 @@ const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
+
+// A blocked wakeup throws conflict(message, details); the message alone cannot say *why* the
+// agent was blocked (paused? terminated? broken org chain?) once the run is history.
+function httpErrorDetails(error: unknown): Record<string, unknown> | null {
+  if (!(error instanceof HttpError)) return null;
+  const { details } = error;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  return details as Record<string, unknown>;
+}
 const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.read_marked",
   "issue.read_unmarked",
@@ -1023,6 +1032,7 @@ export function routineService(
         linkedIssueId: routineRuns.linkedIssueId,
         coalescedIntoRunId: routineRuns.coalescedIntoRunId,
         failureReason: routineRuns.failureReason,
+        failureDetails: routineRuns.failureDetails,
         completedAt: routineRuns.completedAt,
         createdAt: routineRuns.createdAt,
         updatedAt: routineRuns.updatedAt,
@@ -1057,6 +1067,7 @@ export function routineService(
         linkedIssueId: row.linkedIssueId,
         coalescedIntoRunId: row.coalescedIntoRunId,
         failureReason: row.failureReason,
+        failureDetails: row.failureDetails,
         completedAt: row.completedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
@@ -1882,6 +1893,7 @@ export function routineService(
         const failed = await finalizeRun(createdRun.id, {
           status: "failed",
           failureReason,
+          failureDetails: httpErrorDetails(error),
           completedAt: new Date(),
         }, txDb);
         await updateRoutineTouchedState({
@@ -2000,6 +2012,7 @@ export function routineService(
             linkedIssueId: routineRuns.linkedIssueId,
             coalescedIntoRunId: routineRuns.coalescedIntoRunId,
             failureReason: routineRuns.failureReason,
+            failureDetails: routineRuns.failureDetails,
             completedAt: routineRuns.completedAt,
             createdAt: routineRuns.createdAt,
             updatedAt: routineRuns.updatedAt,
@@ -2033,6 +2046,7 @@ export function routineService(
               linkedIssueId: run.linkedIssueId,
               coalescedIntoRunId: run.coalescedIntoRunId,
               failureReason: run.failureReason,
+              failureDetails: run.failureDetails,
               completedAt: run.completedAt,
               createdAt: run.createdAt,
               updatedAt: run.updatedAt,
@@ -2892,6 +2906,7 @@ export function routineService(
           linkedIssueId: routineRuns.linkedIssueId,
           coalescedIntoRunId: routineRuns.coalescedIntoRunId,
           failureReason: routineRuns.failureReason,
+          failureDetails: routineRuns.failureDetails,
           completedAt: routineRuns.completedAt,
           createdAt: routineRuns.createdAt,
           updatedAt: routineRuns.updatedAt,
@@ -2925,6 +2940,7 @@ export function routineService(
         linkedIssueId: row.linkedIssueId,
         coalescedIntoRunId: row.coalescedIntoRunId,
         failureReason: row.failureReason,
+        failureDetails: row.failureDetails,
         completedAt: row.completedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,

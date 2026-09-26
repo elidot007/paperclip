@@ -213,6 +213,8 @@ export interface RoutineRun {
   linkedIssueId: string | null;
   coalescedIntoRunId: string | null;
   failureReason: string | null;
+  /** Structured cause behind `failureReason`, e.g. `{ agentStatus, reason }` from an invokability block. */
+  failureDetails?: Record<string, unknown> | null;
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;

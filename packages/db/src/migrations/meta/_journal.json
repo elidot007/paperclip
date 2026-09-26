@@ -1429,6 +1429,13 @@
       "when": 1785930532996,
       "tag": "0205_fearless_black_widow",
       "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "7",
+      "when": 1790448234455,
+      "tag": "0206_jazzy_mole_man",
+      "breakpoints": true
     }
   ]
 }

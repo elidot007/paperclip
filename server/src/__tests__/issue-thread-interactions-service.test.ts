@@ -668,6 +668,99 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.status).toBe("pending");
   });
 
+  it("keeps a pending card on the historical backfill when the later comment is an ops system_notice (AUT-921)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Historical ops notice must not supersede");
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the weekly policy?",
+      },
+    }, {
+      userId: "local-board",
+    });
+    const createdAt = new Date("2026-05-18T12:00:00.000Z");
+    await db
+      .update(issueThreadInteractions)
+      .set({ createdAt, updatedAt: createdAt })
+      .where(eq(issueThreadInteractions.id, created.id));
+
+    // Same shape the AUT-56 watchdog leaves behind: authorUserId set, no run context, but a
+    // system_notice presentation — the backfill used to read it as a human decision.
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      authorType: "user",
+      presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+      body: "Watchdog: runtime channel degraded.",
+      createdAt: new Date("2026-05-18T12:01:00.000Z"),
+      updatedAt: new Date("2026-05-18T12:01:00.000Z"),
+    });
+
+    await expect(interactionsSvc.expireRequestConfirmationsSupersededByHistoricalComments({
+      id: issueId,
+      companyId,
+    })).resolves.toEqual([]);
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows[0]?.status).toBe("pending");
+  });
+
+  it("still expires the card on the historical backfill for a real later human comment (AUT-921 gate)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Historical human comment supersedes");
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the weekly policy?",
+      },
+    }, {
+      userId: "local-board",
+    });
+    const createdAt = new Date("2026-05-18T12:00:00.000Z");
+    await db
+      .update(issueThreadInteractions)
+      .set({ createdAt, updatedAt: createdAt })
+      .where(eq(issueThreadInteractions.id, created.id));
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      authorType: "user",
+      body: "Please revise this first.",
+      createdAt: new Date("2026-05-18T12:01:00.000Z"),
+      updatedAt: new Date("2026-05-18T12:01:00.000Z"),
+    });
+
+    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByHistoricalComments({
+      id: issueId,
+      companyId,
+    });
+
+    expect(expired).toHaveLength(1);
+    expect(expired[0]).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        commentId,
+      },
+      resolvedByUserId: "local-board",
+    });
+  });
+
   it("keeps ask_user_questions pending when user-comment supersede is explicitly disabled", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Question supersede opt-out");
 

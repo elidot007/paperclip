@@ -35,6 +35,7 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
 import { secretService } from "../services/secrets.ts";
+import { conflict } from "../errors.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1909,6 +1910,48 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.originId, routine.id));
 
     expect(routineIssues).toHaveLength(0);
+  });
+
+  it("persists the invokability details on a blocked routine run, and readable from recentRuns (AUT-921)", async () => {
+    const { routine, svc } = await seedFixture({
+      // Mirrors heartbeat's blocked wakeup: a 409 whose message alone cannot say *why*.
+      wakeup: async () => {
+        throw conflict("Agent is not invokable in its current state", {
+          status: "paused",
+          reason: "paused",
+          invalidOrgChain: false,
+          agentId: "agent-1",
+          agentStatus: "paused",
+        });
+      },
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(run.status).toBe("failed");
+    expect(run.failureReason).toBe("Agent is not invokable in its current state");
+    expect(run.failureDetails).toMatchObject({ agentStatus: "paused", reason: "paused" });
+
+    // The acceptance path: GET /api/routines/{id} reads recentRuns off getDetail.
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.recentRuns[0]?.failureDetails).toMatchObject({ agentStatus: "paused", reason: "paused" });
+    await expect(svc.listRuns(routine.id)).resolves.toMatchObject([
+      { failureDetails: { agentStatus: "paused", reason: "paused" } },
+    ]);
+  });
+
+  it("leaves failureDetails null for a plain failure, so the column is not a blank cheque (AUT-921 gate)", async () => {
+    const { routine, svc } = await seedFixture({
+      wakeup: async () => {
+        throw new Error("queue unavailable");
+      },
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(run.status).toBe("failed");
+    expect(run.failureDetails).toBeNull();
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.recentRuns[0]?.failureDetails ?? null).toBeNull();
   });
 
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {

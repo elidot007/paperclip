@@ -1,0 +1,1 @@
+ALTER TABLE "routine_runs" ADD COLUMN "failure_details" jsonb;
