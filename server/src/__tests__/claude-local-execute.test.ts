@@ -1533,6 +1533,128 @@ describe("claude execute", () => {
     }
   });
 
+  it("does not stamp a 429 death as model_not_found when the resumed transcript quotes model_not_found", async () => {
+    // AUT-1036. This is the no-parsed-result branch: its model-not-found check
+    // scans the whole stdout, and a `--resume`d transcript quotes the previous
+    // run. Until this fix another run's quoted `errorCode: "model_not_found"`
+    // outranked this run's own 429; the platform read that stamp as a missing
+    // key (`configuration_incomplete` → `manual_repair_required`) and enqueued
+    // no wake, so the issue sat until a human swept it.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-429-quoted-text-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeTextFailingClaudeCommand(commandPath, {
+      stdout: [
+        "Reading prior transcript…",
+        JSON.stringify({ run: "348bfdfb", errorCode: "model_not_found", note: "quoted from the previous run" }),
+        "API Error: 429 Rate limit exceeded",
+      ].join("\n"),
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-429-quoted-text",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).not.toBe("model_not_found");
+      expect(result.errorCode).toBe("claude_transient_upstream");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not stamp a quota death as model_not_found when the result event quotes model_not_found", async () => {
+    // AUT-1036, the branch where the CLI did emit a result event. Same defect:
+    // the model-not-found substring match ran before the provider-quota verdict.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-quota-quoted-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error",
+        session_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        is_error: true,
+        result: [
+          "Reading prior transcript…",
+          JSON.stringify({ run: "348bfdfb", errorCode: "model_not_found", note: "quoted from the previous run" }),
+          "You're out of extra usage. Resets at 4pm (America/Chicago).",
+        ].join("\n"),
+        errors: [{ type: "quota_exceeded_error", message: "You're out of extra usage" }],
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-quota-quoted",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).not.toBe("model_not_found");
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not reclassify deterministic Claude failures (auth, max turns) as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-max-turns-"));
     const workspace = path.join(root, "workspace");

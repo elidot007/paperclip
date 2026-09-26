@@ -1000,8 +1000,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
+      // AUT-1036: order matters. This branch is reached only when stdout held no
+      // parsable result event (`parsed` is null because stdout was neither a
+      // result event nor a single JSON blob), so AUT-735's structured turn-cap
+      // guard has nothing to read here and the model-not-found check degrades to
+      // its raw whole-stdout regex — which also scans a `--resume`d transcript
+      // quoting other runs. A 429 or quota death must therefore not be outranked
+      // by a quoted `model_not_found`: the platform reads that stamp as a missing
+      // key, sets `wakePolicy: manual_repair_required`, and enqueues no wake.
+      // Provider quota and transient upstream both match on this run's own error
+      // text, so they are decided first; a genuine model-404 carries no
+      // quota/rate-limit wording and still reaches the model_not_found branch.
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
+        : providerQuota
+        ? "provider_quota"
+        : transientUpstream
+        ? "claude_transient_upstream"
         : isClaudeModelNotFoundFailure({
           parsed: null,
           stdout: proc.stdout,
@@ -1009,10 +1024,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         })
         ? "model_not_found"
-        : providerQuota
-        ? "provider_quota"
-        : transientUpstream
-        ? "claude_transient_upstream"
         : null;
       const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
       return {
@@ -1137,13 +1148,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
-      : failed && isClaudeModelNotFoundFailure({
-        parsed,
-        stdout: proc.stdout,
-        stderr: proc.stderr,
-        errorMessage,
-      })
-      ? "model_not_found"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
       : providerQuota
@@ -1152,6 +1156,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "claude_transient_upstream"
       : claudeRefusal
       ? "claude_refusal"
+      // AUT-1036: model-not-found is last among the failure codes because its
+      // check scans stdout, which a `--resume`d run fills with other runs'
+      // quoted `errorCode: "model_not_found"`. Quota and transient verdicts read
+      // this run's own error text and are strictly better evidence.
+      : failed && isClaudeModelNotFoundFailure({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      })
+      ? "model_not_found"
       : null;
     const errorFamily = providerQuota
       ? "provider_quota"
