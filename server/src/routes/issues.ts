@@ -159,6 +159,7 @@ import {
   findExistingIssueBlockersResolvedWake,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
@@ -8987,6 +8988,24 @@ export function issueRoutes(
             source: "issue.blockers_resolved",
             mutation: "blocker_done",
           });
+        }
+        // AUT-900: waking the dependent is not enough. A dependent left `blocked`
+        // with zero unresolved blockers is a ticket no run can ever start, which is
+        // why this shape has been hand-PATCHed seven times. The level-triggered
+        // backstop owns the status transition (it is where readiness, monitor and
+        // external-wait gating already live) and is idempotent, so the periodic
+        // sweep and the finalize path can both call it without duplicating rules.
+        try {
+          await recoveryService(db, { enqueueWakeup: heartbeat.wakeup }).reconcileResolvedDependencyWakeBackstop({
+            companyId: issue.companyId,
+            blockerIssueId: issue.id,
+            source: "issue.blockers_resolved",
+          });
+        } catch (err) {
+          logger.warn(
+            { err, blockerIssueId: issue.id },
+            "failed to release dead-blocked dependents after blocker completion",
+          );
         }
       }
 

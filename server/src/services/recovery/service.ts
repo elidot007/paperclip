@@ -40,7 +40,7 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -129,7 +129,8 @@ type RecoveryWakeup = (
 
 type ResolvedDependencyWakeBackstopSource =
   | "issue_graph_liveness.backstop"
-  | "workspace.finalize";
+  | "workspace.finalize"
+  | "issue.blockers_resolved";
 
 type ResolvedDependencyWakeBackstopOptions = {
   runId?: string | null;
@@ -954,7 +955,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
-  async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
+  async function hasPersistedDurableWaitPath(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "monitorNextCheckAt">,
+  ) {
     if (issue.monitorNextCheckAt) return true;
 
     return db
@@ -5114,6 +5117,101 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, escalationIssueId: escalation.id };
   }
 
+  /**
+   * Flip a `blocked` ticket back to `todo` when nothing is left to wait for.
+   *
+   * WHY THIS EXISTS (AUT-900, 7th recurrence). `issue_blockers_resolved` wakes the
+   * dependent's assignee but never moves the ticket, so the dependent sits
+   * `blocked` with `blockerAttention.unresolvedBlockerCount == 0` — a state with no
+   * edge that can ever start it. Every occurrence so far (AUT-551/559, AUT-586,
+   * AUT-813, AUT-825/826, AUT-852) was closed by a courier hand-PATCHing statuses.
+   * The wake without the transition is a wake into a dead end, so the transition
+   * belongs with the wake.
+   *
+   * Gated, because `blocked` has three meanings here and only one is the deadlock
+   * this fixes. We only act when *all* of these hold:
+   *   - the ticket really had `blocks` edges (not a hand-blocked courier);
+   *   - every one of them is now resolved (`unresolvedBlockerCount === 0`);
+   *   - no live monitor and no `external owner:`/`external action:` hold, which are
+   *     the two deliberate ways an operator parks a `blocked` ticket;
+   *   - no run owns it and no interaction is waiting on a human.
+   *
+   * Anything else is left alone for a human. A missed release costs one PATCH; a
+   * wrong release starts an agent on a ticket someone is deliberately holding.
+   */
+  async function releaseDeadBlockedDependencyStatus(input: {
+    companyId: string;
+    issue: {
+      id: string;
+      companyId: string;
+      identifier: string | null;
+      description: string | null;
+      monitorNextCheckAt: Date | null;
+    };
+    agentId: string;
+    readiness: { blockerIssueIds: string[]; unresolvedBlockerCount: number };
+    source: string;
+  }) {
+    if (input.readiness.blockerIssueIds.length === 0) return "not_dependency_blocked" as const;
+    if (input.readiness.unresolvedBlockerCount > 0) return "not_dependency_blocked" as const;
+    if (externalWaitFromDescription(input.issue.description)) return "external_wait" as const;
+    if (await hasPersistedDurableWaitPath(input.issue)) return "durable_wait" as const;
+    if (await hasActiveExecutionPath(input.companyId, input.issue.id, input.agentId)) {
+      return "active_path" as const;
+    }
+    if (await hasPendingWakeInteraction(input.companyId, input.issue.id)) return "interaction" as const;
+
+    const blockerLinks = formatIssueLinksForComment(
+      (await issuesSvc.getRelationSummaries(input.issue.id)).blockedBy,
+    );
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>> = null;
+    try {
+      updated = await issuesSvc.update(input.issue.id, { status: "todo" });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issue.id, source: input.source },
+        "failed to release dead-blocked issue after dependency resolution",
+      );
+      return "failed" as const;
+    }
+    if (!updated) return "failed" as const;
+
+    await issuesSvc.addComment(
+      input.issue.id,
+      [
+        "## Released: blockers resolved",
+        "",
+        `Paperclip found this issue \`blocked\` with no unresolved blocker left, so no run could ever start it.`,
+        "",
+        `- Resolved blockers: ${blockerLinks}`,
+        "- Moved it to `todo` so the assignee is woken from a startable state.",
+        "",
+        "If this was parked on purpose, hold it again with a `blocked` status plus a `monitorNextCheckAt` or an `external owner:` line in the description.",
+      ].join("\n"),
+      {},
+    );
+
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "todo",
+        previousStatus: "blocked",
+        reason: "resolved_dependency_deadlock",
+        source: input.source,
+        blockerIssueIds: input.readiness.blockerIssueIds,
+      },
+    });
+    return "released" as const;
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
     const result = {
       checked: 0,
@@ -5126,6 +5224,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      statusReleased: 0,
+      statusReleaseHeld: 0,
       issueIds: [] as string[],
     };
 
@@ -5159,6 +5259,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             id: issues.id,
             companyId: issues.companyId,
             identifier: issues.identifier,
+            description: issues.description,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
             assigneeAgentId: issues.assigneeAgentId,
             totalCount: sql<number>`count(*) over()::int`,
           })
@@ -5174,6 +5276,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           id: issues.id,
           companyId: issues.companyId,
           identifier: issues.identifier,
+          description: issues.description,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
           assigneeAgentId: issues.assigneeAgentId,
           totalCount: sql<number>`count(*) over()::int`,
         })
@@ -5238,6 +5342,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ) {
           result.notReadySkipped += 1;
           continue;
+        }
+
+        // AUT-900: the wake below is a wake into a dead end unless the ticket
+        // also leaves `blocked`. Release first and unconditionally — deliberately
+        // ahead of the `existingWakeSkipped` branch, because the ticket that has
+        // been dead longest is exactly the one whose wake already exists and whose
+        // run has long since finished without moving it.
+        const release = await releaseDeadBlockedDependencyStatus({
+          companyId,
+          issue: candidate,
+          agentId,
+          readiness,
+          source,
+        });
+        if (release === "released") {
+          result.statusReleased += 1;
+          result.issueIds.push(candidate.id);
+        } else if (release !== "not_dependency_blocked") {
+          result.statusReleaseHeld += 1;
         }
 
         const idempotencyKeys = readiness.blockerIssueIds.map((blockerIssueId) =>

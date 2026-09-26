@@ -3224,7 +3224,13 @@ async function listSuccessfulRunHandoffMapForIssues(
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
 }
 
-function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+/**
+ * `blocked` does not only mean "waiting on a blocker". A ticket can also be
+ * deliberately held on an *external* owner by writing these two lines into its
+ * description. Dependency sweeps must never flip such a ticket: read
+ * `hasPersistedDurableWaitPath` for the monitor flavour of the same hold.
+ */
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
   const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
   const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
