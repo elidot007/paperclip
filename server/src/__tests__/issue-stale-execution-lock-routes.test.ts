@@ -592,6 +592,68 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  // AUT-917: a `queued` run is a live owner only while it is still inside the
+  // scheduler queue. This one is 110 minutes past `createdAt` with `startedAt`
+  // still null (AUT-862's shape) — the scheduler will never start it, so the
+  // issue is 409ing against a run that cannot act, exactly as a
+  // `scheduled_retry` owner did before 2ad1753d.
+  it("lets the assignee PATCH past an over-age queued execution owner", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const strandedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: strandedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "manual",
+      startedAt: null,
+      finishedAt: null,
+      createdAt: new Date(Date.now() - 110 * 60_000),
+    });
+
+    const issueId = randomUUID();
+    const staleLockedAt = new Date(Date.now() - 110 * 60_000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "over-age queued execution owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: strandedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: staleLockedAt,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Recovered over-age queued owner" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      title: "Recovered over-age queued owner",
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      // Reclaimed, not left dangling: the agent name key is dropped and the
+      // lock time is re-stamped by the new owner rather than kept stale.
+      executionAgentNameKey: null,
+    });
+    expect(row!.executionLockedAt!.getTime()).toBeGreaterThan(staleLockedAt.getTime());
+  });
+
   it.each(["queued" as const, "running" as const])(
     "still returns 409 when a %s execution owner is a real future execution",
     async (liveOwnerStatus) => {

@@ -733,6 +733,17 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 
 /**
+ * Every ownership read must select these three columns: the bounded `queued`
+ * rule below ages a run off its `createdAt`, so a status-only projection reads
+ * an unknown age and fails open.
+ */
+const heartbeatRunOwnershipColumns = {
+  status: heartbeatRuns.status,
+  startedAt: heartbeatRuns.startedAt,
+  createdAt: heartbeatRuns.createdAt,
+};
+
+/**
  * Whether a heartbeat run can still act as an execution owner.
  *
  * `scheduled_retry` is a placeholder, not an execution. It records that a retry
@@ -743,15 +754,43 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupte
  * 409s against a run that cannot act and the issue can never be re-dispositioned
  * or re-assigned.
  *
- * `queued` and `running` stay live owners. A `queued` run has not started yet,
- * but it will, and clearing its lock would hand the issue to a second run.
+ * `queued` is a live owner only while it is still inside the scheduler's queue.
+ * A `queued` run has not started yet, but it normally will within a lane slot, so
+ * clearing a young one's lock would hand the issue to a second run. Past
+ * `HEARTBEAT_QUEUED_OWNERSHIP_TIMEOUT_MS` with `startedAt` still null it is a
+ * stranded queue row — the scheduler is never going to pick it up, and its lock
+ * produces the same permanent 409 that `scheduled_retry` used to. Measured on
+ * this instance: 7 `in_progress` issues held by `queued` runs, the oldest 110
+ * minutes past its `createdAt`, all still 409ing after a restart.
  */
+export const HEARTBEAT_QUEUED_OWNERSHIP_TIMEOUT_MS = 15 * 60 * 1000;
+
+function heartbeatRunTimestampMs(value: Date | string | null | undefined): number | null {
+  if (value == null) return null;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export function heartbeatRunCanOwnExecution(
-  run: { status: string } | null | undefined,
+  run:
+    | { status: string; startedAt?: Date | string | null; createdAt?: Date | string | null }
+    | null
+    | undefined,
+  now: number = Date.now(),
 ): boolean {
   if (!run) return false;
   if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
-  return run.status !== "scheduled_retry";
+  if (run.status === "scheduled_retry") return false;
+  if (run.status !== "queued") return true;
+  // A queued run that already recorded a start is executing; only an unstarted
+  // one is subject to the queue ceiling.
+  if (run.startedAt) return true;
+  const createdAtMs = heartbeatRunTimestampMs(run.createdAt);
+  // Unknown age: fail open. Stealing the lock from a queue we cannot age is the
+  // failure mode this bound exists to prevent, and the 409 it causes is cheaper
+  // than a double-run.
+  if (createdAtMs == null) return true;
+  return now - createdAtMs <= HEARTBEAT_QUEUED_OWNERSHIP_TIMEOUT_MS;
 }
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
@@ -909,7 +948,7 @@ async function resolveAcceptedPlanClaimOwner(input: {
   }
 
   const existingOwnerRun = await input.dbOrTx
-    .select({ status: heartbeatRuns.status })
+    .select(heartbeatRunOwnershipColumns)
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.claim.ownerRunId))
     .then((rows) => rows[0] ?? null);
@@ -4785,12 +4824,12 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select(heartbeatRunOwnershipColumns)
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
         tx
-          .select({ status: heartbeatRuns.status })
+          .select(heartbeatRunOwnershipColumns)
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
@@ -4855,7 +4894,7 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
       const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
+        .select(heartbeatRunOwnershipColumns)
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
@@ -4908,7 +4947,7 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select(heartbeatRunOwnershipColumns)
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
