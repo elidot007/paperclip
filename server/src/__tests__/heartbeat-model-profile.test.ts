@@ -10,11 +10,13 @@ import {
   isConfigurationIncompleteFailedRun,
 } from "../services/heartbeat.ts";
 
+// A cheap profile that names no model, the shape every built-in adapter now has.
+// AUT-989: the old fixture carried `model: "adapter-cheap"`, which taught the exact
+// habit that produced the 401 — a default model id that outlives the upstream.
 const cheapProfile: AdapterModelProfileDefinition = {
   key: "cheap",
   label: "Cheap",
   adapterConfig: {
-    model: "adapter-cheap",
     modelReasoningEffort: "low",
   },
   source: "adapter_default",
@@ -150,15 +152,16 @@ describe("heartbeat model profile application", () => {
     expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
   });
 
-  // AUT-906: the stranded_assigned_issue recovery re-applies modelProfile:"cheap" to
-  // issues it is trying to rescue. On the local fleet the claude_local adapter's
-  // built-in cheap default is a Claude id the upstream does not serve, so the rescue
-  // run 401s and re-triggers the recovery that wrote it. These three cases pin the
-  // only shape that is safe (enabled:false) against the two that fail open.
+  // AUT-906/AUT-989: the stranded_assigned_issue recovery re-applies modelProfile:"cheap"
+  // to issues it is trying to rescue. On the local fleet the claude_local adapter's
+  // built-in cheap default used to be a Claude id the upstream does not serve, so the
+  // rescue run 401'd and re-triggered the recovery that wrote it. The default now names
+  // no model, so an unconfigured slot inherits the agent's own lane; the armed and
+  // parked cases below stay DANGEROUS and are still the operator's to own.
   describe("cheap profile on a fleet whose upstream serves no Claude ids", () => {
     const agentLane = { model: "space-bunny-free[1m]", effort: "high" };
 
-    it("DISABLED is the only shape that keeps the run on the agent's own lane", () => {
+    it("DISABLED is the only shape that leaves the run profile-free entirely", () => {
       const modelProfile = resolveModelProfileApplication({
         adapterModelProfiles: [cheapProfile],
         agentRuntimeConfig: {
@@ -185,11 +188,15 @@ describe("heartbeat model profile application", () => {
       ).toEqual(agentLane);
     });
 
-    it("ABSENT fails open to the adapter default, it does not fall back safely", () => {
+    // The gate. It reads the shipped claude_local adapter, so re-adding a model id to
+    // packages/adapters/claude-local/src/index.ts turns this red — that is the mutation
+    // proof, not a comment claiming the default is safe.
+    it("keeps an ABSENT slot on the agent's own lane", async () => {
       // An empty or missing slot is the shape AUT-931/D left behind on all 11 agents.
+      const adapterModelProfiles = await listAdapterModelProfiles("claude_local");
       for (const agentRuntimeConfig of [{}, { modelProfiles: {} }, { modelProfiles: { cheap: {} } }]) {
         const modelProfile = resolveModelProfileApplication({
-          adapterModelProfiles: [cheapProfile],
+          adapterModelProfiles,
           agentRuntimeConfig,
           issueModelProfile: "cheap",
           contextSnapshot: {},
@@ -207,8 +214,17 @@ describe("heartbeat model profile application", () => {
             modelProfile,
             issueAdapterConfig: null,
           }),
-        ).not.toEqual(agentLane);
+        ).toEqual(agentLane);
       }
+    });
+
+    it("ships no built-in cheap model id to fail open to", async () => {
+      const cheap = (await listAdapterModelProfiles("claude_local")).find(
+        (profile) => profile.key === "cheap",
+      );
+
+      expect(cheap).toBeDefined();
+      expect(cheap?.adapterConfig).toEqual({});
     });
 
     it("a disabled slot keeps a retired model id parked instead of live", () => {
