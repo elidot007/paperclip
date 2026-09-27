@@ -34,6 +34,83 @@ describe("detectClaudeLoginRequired", () => {
       }).requiresLogin,
     ).toBe(false);
   });
+
+  // AUT-1145, reproduced from run 7bfed83d (subtype=error_max_turns, num_turns=61).
+  // The detector used to scan the whole stdout line-by-line, so the transcript the
+  // model read — here the `CLAUDE_AUTH_REQUIRED_RE` literal from this very file —
+  // was indistinguishable from the run's own failure. The platform stamped
+  // `claude_auth_required`, set wakePolicy manual_repair_required, and enqueued no
+  // wake; 16 such lines existed in that run and zero auth text in its result record.
+  it("ignores auth phrases quoted in the transcript and reads only the CLI's own error records", () => {
+    const quotedSource = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          content: '9:const CLAUDE_AUTH_REQUIRED_RE = /(?:not\\s+logged\\s+in|login\\s+required|unauthorized)/i;',
+        }],
+      },
+    });
+    const assistantText = JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "The guard returns unauthorized when login is required." }] },
+    });
+    const resultRecord = JSON.stringify({
+      type: "result",
+      subtype: "error_max_turns",
+      terminal_reason: "max_turns",
+      num_turns: 61,
+      is_error: true,
+      result: "Reached the turn limit; nothing was left to hand back.",
+    });
+
+    // The quoted transcript really does carry auth phrases…
+    expect(/(?:not\s+logged\s+in|unauthorized|login\s+required)/i.test(quotedSource)).toBe(true);
+    // …but none of them may vote.
+    expect(
+      detectClaudeLoginRequired({
+        parsed: JSON.parse(resultRecord),
+        stdout: `${quotedSource}\n${assistantText}\n${resultRecord}`,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("does not take a successful run's closing message as an auth verdict", () => {
+    // The closing message of a clean run is text the run produced, not a verdict
+    // about the run, so auth wording inside it must not force a login stamp.
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "Checked the endpoint; it returned unauthorized for an anonymous caller.",
+        },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("still reads auth text from an error result record and from stderr", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { subtype: "error_during_execution", is_error: true, result: "API Error: 401 Unauthorized" },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "",
+        stderr: "Please log in. Run `claude login` first.",
+      }).requiresLogin,
+    ).toBe(true);
+  });
 });
 
 describe("isClaudeModelNotFoundError", () => {

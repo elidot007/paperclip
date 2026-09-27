@@ -163,19 +163,57 @@ export function extractClaudeLoginUrl(text: string): string | null {
   return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
 }
 
+/**
+ * AUT-1145: the record's own text can state why the run stopped only when the
+ * CLI flagged that record as an error. For a `result` record with
+ * `is_error: false`, `result` is the model's closing message — text the run
+ * *produced*, not a verdict about the run.
+ */
+function isClaudeOwnErrorResult(parsed: Record<string, unknown> | null): boolean {
+  if (!parsed) return false;
+  if (parsed.is_error === true) return true;
+  return /^error/.test(asString(parsed.subtype, "").trim().toLowerCase());
+}
+
+/**
+ * AUT-1145: on a stream-json run, a `result` record's fields are this run's own
+ * verdict and are read structurally below; `system` records are CLI diagnostics.
+ * Everything else (`user`/`assistant`) is the transcript itself — whatever the
+ * model read, was told, or wrote — so an auth phrase there says the run
+ * *handled* that text, not that it died needing login. Run 7bfed83d died at the
+ * turn cap (subtype=error_max_turns, num_turns=61) but its stdout quoted this
+ * very file's `CLAUDE_AUTH_REQUIRED_RE` literal, so `requiresLogin` came back
+ * true, the platform stamped `claude_auth_required`, set
+ * `wakePolicy: manual_repair_required`, and enqueued no wake. Lines without a
+ * JSON `type` marker are plain CLI/stderr text and stay eligible, so a real
+ * `Invalid API key · Please run /login` on stderr still trips.
+ */
+function isClaudeCliOwnErrorLine(line: string): boolean {
+  const match = /"type"\s*:\s*"([a-z_]+)"/.exec(line);
+  return match ? match[1] === "system" : true;
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
+  // Structured fields are this run's own error record; raw streams are filtered
+  // down to CLI-emitted lines so quoted transcript text cannot vote.
+  const structured = [
+    ...(isClaudeOwnErrorResult(input.parsed) ? [resultText] : []),
+    ...extractClaudeErrorMessages(input.parsed ?? {}),
+  ]
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const cliOwn = [input.stdout, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => line.length > 0 && isClaudeCliOwnErrorLine(line));
 
-  const requiresLogin = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
+  const requiresLogin = [...structured, ...cliOwn].some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
   return {
     requiresLogin,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
